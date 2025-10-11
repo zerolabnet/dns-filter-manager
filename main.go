@@ -3375,12 +3375,12 @@ const htmlTemplate = `
 				justify-content: flex-end;
 			}
 
-			.action-buttons {
+			.card form .action-buttons {
 				width: 100%;
 				flex-direction: column;
 			}
 
-			.action-buttons .btn {
+			.card form .action-buttons .btn {
 				width: 100%;
 				flex: 1 1 100%;
 			}
