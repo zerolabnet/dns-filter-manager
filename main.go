@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -28,6 +29,24 @@ import (
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/time/rate"
 )
+
+// Регулярные выражения для валидации имен
+var (
+	// Безопасные имена: буквы, цифры, дефис, подчеркивание
+	safeNameRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
+	// Безопасные имена устройств (могут содержать точки для доменов)
+	safeDeviceNameRegex = regexp.MustCompile(`^[a-zA-Z0-9._-]+$`)
+)
+
+// isValidName проверяет безопасность имени для UCI команд
+func isValidName(name string) bool {
+	return len(name) > 0 && len(name) < 64 && safeNameRegex.MatchString(name)
+}
+
+// isValidDeviceName проверяет безопасность имени устройства
+func isValidDeviceName(name string) bool {
+	return len(name) > 0 && len(name) < 253 && safeDeviceNameRegex.MatchString(name)
+}
 
 /* ==================== КОНСТАНТЫ ==================== */
 
@@ -114,17 +133,18 @@ type Settings struct {
 type GroupConfig struct {
 	Devices       []string             `json:"devices"`
 	Tag           string               `json:"tag"`
-	Schedule      *Schedule            `json:"schedule,omitempty"`
+	Schedules     []Schedule           `json:"schedules,omitempty"`
 	DisableAction *FilterDisableAction `json:"disable_action,omitempty"`
 	Leasetime     *int                 `json:"leasetime,omitempty"` // TTL в минутах, nil = по умолчанию
 }
 
 type Schedule struct {
-	Enabled   bool `json:"enabled"`
-	StartHour int  `json:"start_hour"`
-	StartMin  int  `json:"start_min"`
-	EndHour   int  `json:"end_hour"`
-	EndMin    int  `json:"end_min"`
+	ID        string `json:"id"` // Уникальный идентификатор расписания
+	Enabled   bool   `json:"enabled"`
+	StartHour int    `json:"start_hour"`
+	StartMin  int    `json:"start_min"`
+	EndHour   int    `json:"end_hour"`
+	EndMin    int    `json:"end_min"`
 }
 
 type FilterDisableAction struct {
@@ -306,6 +326,16 @@ func initSettings() {
 		if settings.Tags == nil {
 			settings.Tags = make(map[string]TagConfig)
 		}
+
+		// Инициализация пустого массива расписаний для существующих групп
+		settings.mu.Lock()
+		for groupName, groupConfig := range settings.Groups {
+			if groupConfig.Schedules == nil {
+				groupConfig.Schedules = []Schedule{}
+				settings.Groups[groupName] = groupConfig
+			}
+		}
+		settings.mu.Unlock()
 
 		addLog("Application started", "info")
 	}
@@ -937,53 +967,135 @@ func saveFilterList(content string) error {
 
 /* ==================== SCHEDULE ==================== */
 
-func isFilterActiveBySchedule(schedule *Schedule) bool {
-	if schedule == nil || !schedule.Enabled {
-		return true
+// Проверка пересечения двух временных интервалов
+func schedulesOverlap(s1, s2 Schedule) bool {
+	start1 := s1.StartHour*minutesPerHour + s1.StartMin
+	end1 := s1.EndHour*minutesPerHour + s1.EndMin
+	start2 := s2.StartHour*minutesPerHour + s2.StartMin
+	end2 := s2.EndHour*minutesPerHour + s2.EndMin
+
+	// Нормализуем интервалы через полночь
+	if start1 > end1 {
+		// Интервал s1 через полночь: [start1, 1440) и [0, end1)
+		if start2 > end2 {
+			// Оба через полночь - пересекаются всегда
+			return true
+		}
+		// s1 через полночь, s2 обычный
+		return start2 < end1 || end2 > start1
 	}
 
-	now := time.Now()
-	current := now.Hour()*minutesPerHour + now.Minute()
-	start := schedule.StartHour*minutesPerHour + schedule.StartMin
-	end := schedule.EndHour*minutesPerHour + schedule.EndMin
+	if start2 > end2 {
+		// s1 обычный, s2 через полночь
+		return start1 < end2 || end1 > start2
+	}
 
-	inRange := (start <= end && current >= start && current < end) ||
-		(start > end && (current >= start || current < end))
-
-	return !inRange
+	// Оба интервала обычные
+	return !(end1 <= start2 || end2 <= start1)
 }
 
-func getNextScheduleTransition(schedule *Schedule, now time.Time) time.Time {
-	currentMinutes := now.Hour()*minutesPerHour + now.Minute()
-	startMinutes := schedule.StartHour*minutesPerHour + schedule.StartMin
-	endMinutes := schedule.EndHour*minutesPerHour + schedule.EndMin
-
-	var nextTransitionMinutes int
-	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
-
-	if startMinutes <= endMinutes {
-		// Обычное расписание (в пределах одного дня)
-		if currentMinutes < startMinutes {
-			nextTransitionMinutes = startMinutes
-		} else if currentMinutes < endMinutes {
-			nextTransitionMinutes = endMinutes
-		} else {
-			// Следующий переход завтра утром
-			return today.Add(hoursPerDay*time.Hour + time.Duration(startMinutes)*time.Minute)
+// Валидация массива расписаний на пересечение
+func validateSchedules(schedules []Schedule) error {
+	for i := 0; i < len(schedules); i++ {
+		if !schedules[i].Enabled {
+			continue
 		}
-	} else {
-		// Расписание через полночь
-		if currentMinutes < endMinutes {
-			nextTransitionMinutes = endMinutes
-		} else if currentMinutes < startMinutes {
-			nextTransitionMinutes = startMinutes
-		} else {
-			// Следующий переход завтра
-			return today.Add(hoursPerDay*time.Hour + time.Duration(endMinutes)*time.Minute)
+		for j := i + 1; j < len(schedules); j++ {
+			if !schedules[j].Enabled {
+				continue
+			}
+			if schedulesOverlap(schedules[i], schedules[j]) {
+				return fmt.Errorf("расписания %s и %s пересекаются", schedules[i].ID, schedules[j].ID)
+			}
+		}
+	}
+	return nil
+}
+
+// Проверка активности для массива расписаний
+func isFilterActiveBySchedules(schedules []Schedule) bool {
+	now := time.Now()
+	current := now.Hour()*minutesPerHour + now.Minute()
+
+	for _, schedule := range schedules {
+		if !schedule.Enabled {
+			continue
+		}
+
+		start := schedule.StartHour*minutesPerHour + schedule.StartMin
+		end := schedule.EndHour*minutesPerHour + schedule.EndMin
+
+		inRange := (start <= end && current >= start && current < end) ||
+			(start > end && (current >= start || current < end))
+
+		if inRange {
+			// Если хотя бы одно расписание активно (время отключения), возвращаем false
+			return false
 		}
 	}
 
-	return today.Add(time.Duration(nextTransitionMinutes) * time.Minute)
+	// Если ни одно расписание не активно, фильтр должен быть включен
+	return true
+}
+
+// Получение следующего перехода для массива расписаний
+func getNextScheduleTransition(schedules []Schedule, now time.Time) time.Time {
+	var nextTransition *time.Time
+
+	for _, schedule := range schedules {
+		if !schedule.Enabled {
+			continue
+		}
+
+		currentMinutes := now.Hour()*minutesPerHour + now.Minute()
+		startMinutes := schedule.StartHour*minutesPerHour + schedule.StartMin
+		endMinutes := schedule.EndHour*minutesPerHour + schedule.EndMin
+
+		var nextTransitionMinutes int
+		today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+
+		if startMinutes <= endMinutes {
+			// Обычное расписание (в пределах одного дня)
+			if currentMinutes < startMinutes {
+				nextTransitionMinutes = startMinutes
+			} else if currentMinutes < endMinutes {
+				nextTransitionMinutes = endMinutes
+			} else {
+				// Следующий переход завтра утром
+				candidateTime := today.Add(hoursPerDay*time.Hour + time.Duration(startMinutes)*time.Minute)
+				if nextTransition == nil || candidateTime.Before(*nextTransition) {
+					nextTransition = &candidateTime
+				}
+				continue
+			}
+		} else {
+			// Расписание через полночь
+			if currentMinutes < endMinutes {
+				nextTransitionMinutes = endMinutes
+			} else if currentMinutes < startMinutes {
+				nextTransitionMinutes = startMinutes
+			} else {
+				// Следующий переход завтра
+				candidateTime := today.Add(hoursPerDay*time.Hour + time.Duration(endMinutes)*time.Minute)
+				if nextTransition == nil || candidateTime.Before(*nextTransition) {
+					nextTransition = &candidateTime
+				}
+				continue
+			}
+		}
+
+		candidateTime := today.Add(time.Duration(nextTransitionMinutes) * time.Minute)
+		if nextTransition == nil || candidateTime.Before(*nextTransition) {
+			nextTransition = &candidateTime
+		}
+	}
+
+	if nextTransition != nil {
+		return *nextTransition
+	}
+
+	// Если расписаний нет, возвращаем дефолтный интервал
+	return now.Add(scheduleDefaultInterval)
 }
 
 // Функция для инициирования немедленной проверки расписания
@@ -996,7 +1108,7 @@ func triggerScheduleCheck() {
 	}
 }
 
-// Проверяет и применяет расписания для всех групп
+// Проверка и применение расписаний для всех групп
 func (om *OpenWrtManager) checkAndApplySchedules() {
 	if !om.connected {
 		return
@@ -1017,8 +1129,8 @@ func (om *OpenWrtManager) checkAndApplySchedules() {
 	settings.mu.RUnlock()
 
 	for groupName, groupConfig := range groups {
-		if groupConfig.Schedule != nil && groupConfig.Schedule.Enabled {
-			shouldBeActive := isFilterActiveBySchedule(groupConfig.Schedule)
+		if len(groupConfig.Schedules) > 0 {
+			shouldBeActive := isFilterActiveBySchedules(groupConfig.Schedules)
 			currentlyActive := groupStates[groupName]
 
 			if shouldBeActive != currentlyActive {
@@ -1037,7 +1149,7 @@ func (om *OpenWrtManager) checkAndApplySchedules() {
 	}
 }
 
-// Вычисляет время до следующего события расписания
+// Вычисление времени до следующего события расписания
 func (om *OpenWrtManager) getNextScheduleTime() time.Duration {
 	if !om.connected {
 		return disconnectedCheckInterval
@@ -1048,8 +1160,8 @@ func (om *OpenWrtManager) getNextScheduleTime() time.Duration {
 
 	settings.mu.RLock()
 	for _, groupConfig := range settings.Groups {
-		if groupConfig.Schedule != nil && groupConfig.Schedule.Enabled {
-			nextTime := getNextScheduleTransition(groupConfig.Schedule, now)
+		if len(groupConfig.Schedules) > 0 {
+			nextTime := getNextScheduleTransition(groupConfig.Schedules, now)
 			if nextEventTime == nil || nextTime.Before(*nextEventTime) {
 				nextEventTime = &nextTime
 			}
@@ -1519,45 +1631,68 @@ func statusHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func scheduleGetHandler(w http.ResponseWriter, r *http.Request) {
-	groupName := strings.TrimPrefix(r.URL.Path, "/api/schedule/")
+// Получение списка расписаний группы
+func schedulesGetHandler(w http.ResponseWriter, r *http.Request) {
+	groupName := strings.TrimPrefix(r.URL.Path, "/api/schedules/")
 
 	settings.mu.RLock()
 	groupConfig, exists := settings.Groups[groupName]
 	settings.mu.RUnlock()
 
-	if exists && groupConfig.Schedule != nil {
-		json.NewEncoder(w).Encode(groupConfig.Schedule)
+	if exists {
+		json.NewEncoder(w).Encode(groupConfig.Schedules)
 	} else {
-		defaultSchedule := Schedule{
-			Enabled:   false,
-			StartHour: defaultStartHour,
-			StartMin:  defaultStartMin,
-			EndHour:   defaultEndHour,
-			EndMin:    defaultEndMin,
-		}
-		json.NewEncoder(w).Encode(defaultSchedule)
+		json.NewEncoder(w).Encode([]Schedule{})
 	}
 }
 
-func scheduleSaveHandler(w http.ResponseWriter, r *http.Request) {
+// Сохранение массива расписаний
+func schedulesSaveHandler(w http.ResponseWriter, r *http.Request) {
 	groupName := r.FormValue("group_name")
-	enabled := r.FormValue("enabled") == "true"
-	startHour, _ := strconv.Atoi(r.FormValue("start_hour"))
-	startMin, _ := strconv.Atoi(r.FormValue("start_min"))
-	endHour, _ := strconv.Atoi(r.FormValue("end_hour"))
-	endMin, _ := strconv.Atoi(r.FormValue("end_min"))
+	schedulesJSON := r.FormValue("schedules")
+
+	var schedules []Schedule
+	if err := json.Unmarshal([]byte(schedulesJSON), &schedules); err != nil {
+		response := Response{Desc: fmt.Sprintf("Ошибка парсинга расписаний: %v", err), Level: "error"}
+		json.NewEncoder(w).Encode(response)
+		return
+	}
+
+	// Валидация диапазонов времени
+	for i, s := range schedules {
+		if s.StartHour < 0 || s.StartHour > 23 {
+			response := Response{Desc: fmt.Sprintf("Расписание %d: некорректные часы начала (0-23)", i+1), Level: "error"}
+			json.NewEncoder(w).Encode(response)
+			return
+		}
+		if s.EndHour < 0 || s.EndHour > 23 {
+			response := Response{Desc: fmt.Sprintf("Расписание %d: некорректные часы окончания (0-23)", i+1), Level: "error"}
+			json.NewEncoder(w).Encode(response)
+			return
+		}
+		if s.StartMin < 0 || s.StartMin > 59 {
+			response := Response{Desc: fmt.Sprintf("Расписание %d: некорректные минуты начала (0-59)", i+1), Level: "error"}
+			json.NewEncoder(w).Encode(response)
+			return
+		}
+		if s.EndMin < 0 || s.EndMin > 59 {
+			response := Response{Desc: fmt.Sprintf("Расписание %d: некорректные минуты окончания (0-59)", i+1), Level: "error"}
+			json.NewEncoder(w).Encode(response)
+			return
+		}
+	}
+
+	// Валидация на пересечения
+	if err := validateSchedules(schedules); err != nil {
+		response := Response{Desc: fmt.Sprintf("Ошибка валидации: %v", err), Level: "error"}
+		json.NewEncoder(w).Encode(response)
+		return
+	}
 
 	settings.mu.Lock()
 	groupConfig, exists := settings.Groups[groupName]
 	if exists {
-		groupConfig.Schedule = &Schedule{
-			Enabled:   enabled,
-			StartHour: startHour,
-			StartMin:  startMin,
-			EndHour:   endHour,
-			EndMin:    endMin,
-		}
+		groupConfig.Schedules = schedules
 		settings.Groups[groupName] = groupConfig
 	}
 	settings.mu.Unlock()
@@ -1573,48 +1708,7 @@ func scheduleSaveHandler(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(response)
 	} else {
 		triggerScheduleCheck()
-		response := Response{Desc: "Расписание сохранено", Level: "success"}
-		json.NewEncoder(w).Encode(response)
-	}
-}
-
-func scheduleToggleHandler(w http.ResponseWriter, r *http.Request) {
-	groupName := r.FormValue("group")
-	enabled := r.FormValue("enabled") == "true"
-
-	settings.mu.Lock()
-	groupConfig, exists := settings.Groups[groupName]
-	if exists {
-		if groupConfig.Schedule == nil {
-			groupConfig.Schedule = &Schedule{
-				Enabled:   false,
-				StartHour: defaultStartHour,
-				StartMin:  defaultStartMin,
-				EndHour:   defaultEndHour,
-				EndMin:    defaultEndMin,
-			}
-		}
-		groupConfig.Schedule.Enabled = enabled
-		settings.Groups[groupName] = groupConfig
-	}
-	settings.mu.Unlock()
-
-	if !exists {
-		response := Response{Desc: "Группа не найдена", Level: "error"}
-		json.NewEncoder(w).Encode(response)
-		return
-	}
-
-	if err := saveSettings(); err != nil {
-		response := Response{Desc: fmt.Sprintf("Ошибка сохранения: %v", err), Level: "error"}
-		json.NewEncoder(w).Encode(response)
-	} else {
-		triggerScheduleCheck()
-		status := "выключено"
-		if enabled {
-			status = "включено"
-		}
-		response := Response{Desc: fmt.Sprintf("Расписание группы %s %s", groupName, status), Level: "success"}
+		response := Response{Desc: "Расписания сохранены", Level: "success"}
 		json.NewEncoder(w).Encode(response)
 	}
 }
@@ -1870,18 +1964,26 @@ func toggleHandler(w http.ResponseWriter, r *http.Request) {
 		response := Response{Desc: fmt.Sprintf("Ошибка: %v", err), Level: "error"}
 		json.NewEncoder(w).Encode(response)
 	} else {
-		// Отключаем расписание при ручном переключении
+		// Отключаем все расписания при ручном переключении
 		settings.mu.Lock()
 		groupConfig, exists := settings.Groups[group]
-		if exists && groupConfig.Schedule != nil && groupConfig.Schedule.Enabled {
-			groupConfig.Schedule.Enabled = false
+		if exists && len(groupConfig.Schedules) > 0 {
+			anyEnabled := false
+			for i := range groupConfig.Schedules {
+				if groupConfig.Schedules[i].Enabled {
+					groupConfig.Schedules[i].Enabled = false
+					anyEnabled = true
+				}
+			}
 			settings.Groups[group] = groupConfig
 			settings.mu.Unlock()
 
-			if saveErr := saveSettings(); saveErr != nil {
-				log.Printf("Warning: Failed to save schedule state: %v", saveErr)
+			if anyEnabled {
+				if saveErr := saveSettings(); saveErr != nil {
+					log.Printf("Warning: Failed to save schedule state: %v", saveErr)
+				}
+				addLog(fmt.Sprintf("Расписания группы %s отключены (переход на ручное управление)", group), "info")
 			}
-			addLog(fmt.Sprintf("Расписание группы %s отключено (переход на ручное управление)", group), "info")
 		} else {
 			settings.mu.Unlock()
 		}
@@ -1951,12 +2053,17 @@ func createTagHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Теперь получаем и очищаем значения
 	tagName := strings.TrimSpace(r.FormValue("tagname"))
 	dhcpOptionsStr := strings.TrimSpace(r.FormValue("dhcpoptions"))
 
-	// Проверка заполнения полей
-	if tagName == "" || dhcpOptionsStr == "" {
+	// Валидация имени тега
+	if !isValidName(tagName) {
+		response := Response{Desc: "Некорректное имя тега. Используйте только буквы, цифры, дефис и подчеркивание (макс. 63 символа)", Level: "error"}
+		json.NewEncoder(w).Encode(response)
+		return
+	}
+
+	if dhcpOptionsStr == "" {
 		response := Response{Desc: "Заполните все поля", Level: "error"}
 		json.NewEncoder(w).Encode(response)
 		return
@@ -2050,8 +2157,16 @@ func createGroupHandler(w http.ResponseWriter, r *http.Request) {
 	groupName := strings.TrimSpace(r.FormValue("groupname"))
 	tag := strings.TrimSpace(r.FormValue("tag"))
 
-	if groupName == "" || tag == "" {
-		response := Response{Desc: "Заполните все поля", Level: "error"}
+	// Валидация имени группы
+	if !isValidName(groupName) {
+		response := Response{Desc: "Некорректное имя группы. Используйте только буквы, цифры, дефис и подчеркивание (макс. 63 символа)", Level: "error"}
+		json.NewEncoder(w).Encode(response)
+		return
+	}
+
+	// Валидация имени тега
+	if !isValidName(tag) {
+		response := Response{Desc: "Некорректное имя тега", Level: "error"}
 		json.NewEncoder(w).Encode(response)
 		return
 	}
@@ -2069,10 +2184,20 @@ func createGroupHandler(w http.ResponseWriter, r *http.Request) {
 	var devices []string
 	devices = r.Form["devices"]
 
+	// Валидация имен устройств
+	for _, device := range devices {
+		if !isValidDeviceName(device) {
+			response := Response{Desc: fmt.Sprintf("Некорректное имя устройства: %s", device), Level: "error"}
+			json.NewEncoder(w).Encode(response)
+			return
+		}
+	}
+
 	settings.mu.Lock()
 	settings.Groups[groupName] = GroupConfig{
-		Devices: devices,
-		Tag:     tag,
+		Devices:   devices,
+		Tag:       tag,
+		Schedules: []Schedule{}, // Инициализируем пустым массивом
 	}
 	settings.mu.Unlock()
 
@@ -2097,8 +2222,9 @@ func updateGroupHandler(w http.ResponseWriter, r *http.Request) {
 	groupName := r.FormValue("groupname")
 	tag := strings.TrimSpace(r.FormValue("tag"))
 
-	if groupName == "" || tag == "" {
-		response := Response{Desc: "Заполните все поля", Level: "error"}
+	// Валидация имени тега
+	if !isValidName(tag) {
+		response := Response{Desc: "Некорректное имя тега", Level: "error"}
 		json.NewEncoder(w).Encode(response)
 		return
 	}
@@ -2116,6 +2242,15 @@ func updateGroupHandler(w http.ResponseWriter, r *http.Request) {
 	var devices []string
 	devices = r.Form["devices"]
 
+	// Валидация имен устройств
+	for _, device := range devices {
+		if !isValidDeviceName(device) {
+			response := Response{Desc: fmt.Sprintf("Некорректное имя устройства: %s", device), Level: "error"}
+			json.NewEncoder(w).Encode(response)
+			return
+		}
+	}
+
 	// Обновление устройств в OpenWrt
 	if manager.connected {
 		if err := manager.updateGroupDevices(groupName, oldGroupConfig.Devices, devices, oldGroupConfig.Tag); err != nil {
@@ -2131,7 +2266,7 @@ func updateGroupHandler(w http.ResponseWriter, r *http.Request) {
 	settings.Groups[groupName] = GroupConfig{
 		Devices:       devices,
 		Tag:           tag,
-		Schedule:      oldGroupConfig.Schedule,
+		Schedules:     oldGroupConfig.Schedules, // Сохраняем расписания
 		DisableAction: oldGroupConfig.DisableAction,
 		Leasetime:     oldGroupConfig.Leasetime,
 	}
@@ -2454,9 +2589,11 @@ func main() {
 	// API endpoints с middleware
 	mux.HandleFunc("/api/theme", apiPostMiddleware(themeHandler))
 	mux.HandleFunc("/api/status", apiMiddleware(statusHandler))
-	mux.HandleFunc("/api/schedule/", apiMiddleware(scheduleGetHandler))
-	mux.HandleFunc("/api/schedule-save", apiPostMiddleware(scheduleSaveHandler))
-	mux.HandleFunc("/api/schedule-toggle", apiPostMiddleware(scheduleToggleHandler))
+
+	// Endpoints для массива расписаний
+	mux.HandleFunc("/api/schedules/", apiMiddleware(schedulesGetHandler))
+	mux.HandleFunc("/api/schedules-save", apiPostMiddleware(schedulesSaveHandler))
+
 	mux.HandleFunc("/api/disable-action/", apiMiddleware(disableActionGetHandler))
 	mux.HandleFunc("/api/disable-action-save", apiPostMiddleware(disableActionSaveHandler))
 	mux.HandleFunc("/api/leasetime/", apiMiddleware(leasetimeGetHandler))
@@ -2759,6 +2896,7 @@ const htmlTemplate = `
 			background-color: rgba(0,0,0,0.5);
 			backdrop-filter: blur(4px);
 			animation: fadeIn 0.2s ease;
+			overflow-y: auto;
 		}
 
 		@keyframes fadeIn {
@@ -2768,11 +2906,11 @@ const htmlTemplate = `
 
 		.schedule-modal-content {
 			background-color: var(--card-bg);
-			margin: 10% auto;
+			margin: 5% auto;
 			padding: 24px;
 			border: 1px solid var(--border-color);
 			border-radius: 12px;
-			width: 450px;
+			width: 600px;
 			max-width: 90%;
 			box-shadow: 0 4px 20px var(--shadow-color);
 			animation: slideDown 0.3s ease;
@@ -2789,12 +2927,87 @@ const htmlTemplate = `
 			}
 		}
 
+		.schedules-list {
+			margin: 20px 0;
+			max-height: 400px;
+			overflow-y: auto;
+		}
+
+		.schedule-item {
+			background: var(--hover-bg);
+			border: 1px solid var(--border-color);
+			border-radius: 8px;
+			padding: 16px;
+			margin-bottom: 12px;
+			position: relative;
+		}
+
+		.schedule-item.disabled {
+			opacity: 0.6;
+		}
+
+		.schedule-item-header {
+			display: flex;
+			justify-content: space-between;
+			align-items: center;
+			margin-bottom: 12px;
+		}
+
+		.schedule-item-title {
+			font-weight: 600;
+			font-size: 14px;
+		}
+
+		.schedule-item-actions {
+			display: flex;
+			gap: 8px;
+		}
+
+		.schedules-preview {
+			display: flex;
+			flex-wrap: wrap;
+			gap: 6px;
+			margin-top: 8px;
+		}
+
+		.schedule-preview-item {
+			display: inline-flex;
+			align-items: center;
+			gap: 6px;
+			background: rgba(59, 130, 246, 0.1);
+			border: 1px solid rgba(59, 130, 246, 0.3);
+			padding: 4px 8px;
+			border-radius: 6px;
+			font-size: 12px;
+			color: var(--primary-color);
+			font-family: 'Monaco', monospace;
+		}
+
+		.schedule-preview-item.disabled {
+			opacity: 0.6;
+			background: rgba(100, 116, 139, 0.1);
+			border-color: rgba(100, 116, 139, 0.3);
+			color: var(--text-secondary);
+		}
+
+		.schedule-preview-icon {
+			width: 8px;
+			height: 8px;
+			border-radius: 50%;
+			background: var(--success-color);
+			flex-shrink: 0;
+		}
+
+		.schedule-preview-item.disabled .schedule-preview-icon {
+			background: var(--text-secondary);
+		}
+
 		.time-inputs {
 			display: grid;
 			grid-template-columns: 1fr auto 1fr;
 			gap: 12px;
 			align-items: center;
-			margin: 16px 0;
+			margin: 12px 0;
 		}
 
 		.time-group {
@@ -2825,12 +3038,26 @@ const htmlTemplate = `
 			border-top: 1px solid var(--border-color);
 		}
 
+		.schedule-buttons {
+			padding-top: 8px;
+			border-top: 1px solid var(--border-color);
+			display: flex;
+			flex-wrap: wrap;
+			gap: 8px;
+		}
+
+		.schedule-controls > .schedule-buttons:first-child {
+			border-top: none;
+			padding-top: 0;
+		}
+
 		.schedule-status {
 			display: flex;
 			align-items: center;
 			gap: 12px;
 			font-size: 13px;
 			margin-bottom: 6px;
+			flex-wrap: wrap;
 		}
 
 		.schedule-toggle-label {
@@ -2843,6 +3070,15 @@ const htmlTemplate = `
 		.schedule-toggle-label input {
 			width: auto;
 			margin-right: 6px;
+		}
+
+		.schedule-badge {
+			background: rgba(59, 130, 246, 0.1);
+			color: var(--primary-color);
+			padding: 4px 8px;
+			border-radius: 4px;
+			font-size: 12px;
+			font-weight: 500;
 		}
 
 		.card {
@@ -3390,18 +3626,39 @@ const htmlTemplate = `
 				margin: 5% auto;
 			}
 
-			.schedule-toggle-label {
-				position: relative;
-				padding: 12px;
-				min-width: 48px;
-				min-height: 48px;
-				display: inline-flex;
-				align-items: center;
-				justify-content: center;
+			/* Увеличенные чекбоксы для расписаний */
+			.schedule-item-title input[type="checkbox"] {
+				transform: scale(1.5);
 			}
 
-			.schedule-toggle-label input[type="checkbox"] {
+			#editEnabled {
 				transform: scale(1.5);
+			}
+
+			/* Оптимизация модального окна расписаний для мобильных */
+			.schedule-item {
+				padding: 12px;
+			}
+
+			.schedule-item-header {
+				flex-direction: column;
+				align-items: flex-start;
+				gap: 12px;
+			}
+
+			.schedule-item-title {
+				width: 100%;
+			}
+
+			.schedule-item-actions {
+				width: 100%;
+				justify-content: flex-start;
+				gap: 8px;
+			}
+
+			.schedule-item-actions .btn {
+				flex: 1;
+				min-width: 100px;
 			}
 		}
 
@@ -3425,6 +3682,51 @@ const htmlTemplate = `
 
 			.device-options {
 				max-height: 150px;
+			}
+
+			/* Форма редактирования расписания - выравнивание в столбик */
+			.time-inputs {
+				display: flex;
+				flex-direction: column;
+				gap: 12px;
+				align-items: flex-start;
+			}
+
+			.time-group {
+				display: grid;
+				grid-template-columns: auto auto auto auto;
+				gap: 8px;
+				align-items: center;
+				width: 100%;
+			}
+
+			.time-group > span:first-child {
+				min-width: 30px;
+			}
+
+			.time-group .time-select:first-of-type,
+			.time-group .time-select:last-of-type {
+				width: 60px;
+			}
+
+			/* Если не умещается, переносим "по" на следующую строку */
+			@supports (display: grid) {
+				.time-inputs {
+					display: flex;
+					flex-wrap: wrap;
+					gap: 12px;
+					align-items: center;
+					justify-content: center;
+				}
+
+				.time-group {
+					flex: 0 1 auto;
+				}
+
+				.time-inputs > span {
+					flex: 0 0 auto;
+					padding: 0 4px;
+				}
 			}
 		}
 	</style>
@@ -3463,11 +3765,10 @@ const htmlTemplate = `
 		<div class="card">
 			<h3>Подключение к роутеру</h3>
 			<form method="POST" action="/connect" class="connection-form">
-				<input type="text" name="host" value="192.168.1.1:22" placeholder="Хост" required>
-				<input type="text" name="user" value="root" placeholder="Пользователь" required>
+				<input type="text" name="host" placeholder="Адрес роутера:порт (192.168.1.1:22)" required>
+				<input type="text" name="user" placeholder="Имя пользователя (root)" required>
 				<input type="password" name="password" placeholder="Пароль" required>
 				<button type="submit" class="btn btn-primary">Подключиться</button>
-
 				<div style="grid-column: 1 / -1; margin-top: 5px;">
 					<label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
 						<input type="checkbox" name="auto_connect" {{if .Settings.AutoConnect}}checked{{end}} style="width: auto; margin-right: 4px;">
@@ -3487,12 +3788,12 @@ const htmlTemplate = `
 				</div>
 
 				<div class="form-group">
-					<label>Имя пользователя AdGuard</label>
+					<label>Имя пользователя</label>
 					<input type="text" name="adguard_user" placeholder="admin" value="{{.Settings.AdGuardUser}}">
 				</div>
 
 				<div class="form-group">
-					<label>Пароль AdGuard</label>
+					<label>Пароль</label>
 					<input type="password" name="adguard_pass" placeholder="Введите пароль для изменения">
 				</div>
 
@@ -3531,41 +3832,33 @@ const htmlTemplate = `
 
 					<!-- Блок управления расписанием -->
 					<div class="schedule-controls">
-						{{$schedule := $config.Schedule}}
-						{{if $schedule}}
-						<div class="schedule-status">
-							<label class="schedule-toggle-label" title="{{if $schedule.Enabled}}Выключить расписание{{else}}Включить расписание{{end}}">
-								<input type="checkbox" {{if $schedule.Enabled}}checked{{end}}
-									   onchange="toggleSchedule('{{$group}}', this.checked); updateScheduleTooltip(this)">
-								Расписание
-							</label>
-							{{if $schedule.Enabled}}
+						{{if $config.Schedules}}
+						<div class="schedule-status" data-group="{{$group}}">
 							<span style="color: var(--text-secondary);">
-								(отключение фильтра с {{printf "%02d:%02d" $schedule.StartHour $schedule.StartMin}}
-								по {{printf "%02d:%02d" $schedule.EndHour $schedule.EndMin}})
+								Расписаний: {{len $config.Schedules}}
+								<span class="schedules-enabled-info"></span>
 							</span>
-							{{else}}
-							<span style="color: var(--text-secondary);">
-								(ручное управление)
-							</span>
-							{{end}}
 						</div>
+						<!-- Список расписаний -->
+						<div class="schedules-preview" data-group="{{$group}}" style="margin-top: 8px; margin-bottom: 8px;"></div>
 						{{end}}
-						<button type="button" class="btn btn-secondary btn-small"
-								onclick="openScheduleModal('{{$group}}')"
-								style="margin-top: 6px; font-size: 12px; padding: 4px 8px;">
-							Настроить расписание
-						</button>
-						<button type="button" class="btn btn-secondary btn-small"
-								onclick="openDisableActionModal('{{$group}}')"
-								style="margin-top: 6px; font-size: 12px; padding: 4px 8px;">
-							Действие при отключении
-						</button>
-						<button type="button" class="btn btn-secondary btn-small"
-								onclick="openLeasetimeModal('{{$group}}')"
-								style="margin-top: 6px; font-size: 12px; padding: 4px 8px;">
-							TTL (срок аренды)
-						</button>
+						<div class="schedule-buttons">
+							<button type="button" class="btn btn-secondary btn-small"
+									onclick="openScheduleModal('{{$group}}')"
+									style="font-size: 12px; padding: 4px 8px;">
+								Настроить расписания
+							</button>
+							<button type="button" class="btn btn-secondary btn-small"
+									onclick="openDisableActionModal('{{$group}}')"
+									style="font-size: 12px; padding: 4px 8px;">
+								Действие при отключении
+							</button>
+							<button type="button" class="btn btn-secondary btn-small"
+									onclick="openLeasetimeModal('{{$group}}')"
+									style="font-size: 12px; padding: 4px 8px;">
+								TTL (срок аренды)
+							</button>
+						</div>
 					</div>
 				</div>
 
@@ -3798,47 +4091,23 @@ const htmlTemplate = `
 		{{end}}
 	</div>
 
-	<!-- Модальное окно для настройки расписания -->
+	<!-- Модальное окно для настройки расписаний -->
 	<div id="scheduleModal" class="schedule-modal">
 		<div class="schedule-modal-content">
-			<h3>Настройка расписания для группы "<span id="scheduleGroupName"></span>"</h3>
+			<h3>Настройка расписаний для группы "<span id="scheduleGroupName"></span>"</h3>
+			<p style="color: var(--text-secondary); font-size: 13px; margin-bottom: 16px;">
+				Фильтр будет автоматически отключаться в указанные периоды времени
+			</p>
 
-			<form id="scheduleForm">
-				<input type="hidden" id="modalGroupName" name="group_name">
+			<input type="hidden" id="modalGroupName" name="group_name">
 
-				<div class="form-group">
-					<label>
-						<input type="checkbox" id="scheduleEnabled" name="enabled" value="true" style="width: auto; margin-right: 8px;">
-						Включить автоматическое управление по расписанию
-					</label>
-				</div>
+			<!-- Список существующих расписаний -->
+			<div id="schedulesList" class="schedules-list"></div>
 
-				<div class="form-group">
-					<label>Время отключения фильтра:</label>
-					<div class="time-inputs">
-						<div class="time-group">
-							<span>С</span>
-							<select id="startHour" name="start_hour" class="time-select"></select>
-							<span>:</span>
-							<select id="startMin" name="start_min" class="time-select"></select>
-						</div>
-
-						<span>по</span>
-
-						<div class="time-group">
-							<select id="endHour" name="end_hour" class="time-select"></select>
-							<span>:</span>
-							<select id="endMin" name="end_min" class="time-select"></select>
-						</div>
-					</div>
-					<div class="form-help">Фильтр будет автоматически отключаться в указанное время</div>
-				</div>
-
-				<div class="modal-actions">
-					<button type="button" class="btn btn-secondary" onclick="closeScheduleModal()">Отмена</button>
-					<button type="button" class="btn btn-success" onclick="saveSchedule()">Сохранить</button>
-				</div>
-			</form>
+			<div class="modal-actions">
+				<button type="button" class="btn btn-success" onclick="addNewSchedule()">+ Добавить расписание</button>
+				<button type="button" class="btn btn-secondary" onclick="closeScheduleModal()">Закрыть</button>
+			</div>
 		</div>
 	</div>
 
@@ -3852,7 +4121,7 @@ const htmlTemplate = `
 				<div class="form-group">
 					<label style="display: flex; align-items: center; gap: 8px;">
 						<input type="radio" name="mode" value="remove" checked onchange="toggleTagSelect()" style="width: auto; margin: 0;">
-						<span>Удалять тег (устройство без фильтрации)</span>
+						<span>Удалять тег (поведение по умолчанию)</span>
 					</label>
 				</div>
 
@@ -3919,6 +4188,10 @@ const htmlTemplate = `
 	</div>
 
 	<script>
+		// Глобальные переменные для управления расписаниями
+		var currentSchedules = [];
+		var currentGroupName = '';
+
 		// Theme management
 		function setTheme(isDark) {
 			document.documentElement.setAttribute('data-theme', isDark ? 'dark' : 'light');
@@ -3934,33 +4207,35 @@ const htmlTemplate = `
 
 		// Load saved theme
 		function loadTheme() {
-			const savedTheme = localStorage.getItem('theme');
-			const systemDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
-			const isDark = savedTheme ? savedTheme === 'dark' : systemDark;
+			var savedTheme = localStorage.getItem('theme');
+			var systemDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+			var isDark = savedTheme ? savedTheme === 'dark' : systemDark;
 
 			document.getElementById('theme-toggle').checked = isDark;
 			setTheme(isDark);
 		}
 
 		// Status message notifications
-		function showStatus(message, type = 'success') {
+		function showStatus(message, type) {
+			type = type || 'success';
+
 			// Remove existing status message
-			const existing = document.querySelector('.status-message');
+			var existing = document.querySelector('.status-message');
 			if (existing) existing.remove();
 
 			// Create new status message
-			const statusDiv = document.createElement('div');
+			var statusDiv = document.createElement('div');
 			statusDiv.className = 'status-message ' + type;
 			statusDiv.textContent = message;
 			document.body.appendChild(statusDiv);
 
 			// Show status message
-			setTimeout(() => statusDiv.classList.add('show'), 100);
+			setTimeout(function() { statusDiv.classList.add('show'); }, 100);
 
 			// Auto hide
-			setTimeout(() => {
+			setTimeout(function() {
 				statusDiv.classList.remove('show');
-				setTimeout(() => statusDiv.remove(), 300);
+				setTimeout(function() { statusDiv.remove(); }, 300);
 			}, 3000);
 		}
 
@@ -3968,119 +4243,302 @@ const htmlTemplate = `
 		function updateDeviceCount() {
 			document.addEventListener('change', function(e) {
 				if (e.target.type === 'checkbox' && e.target.name === 'devices') {
-					const container = e.target.closest('.device-selector');
+					var container = e.target.closest('.device-selector');
 					if (container) {
-						const checkboxes = container.querySelectorAll('input[type="checkbox"]:checked');
-						const summary = container.querySelector('summary');
-						const count = checkboxes.length;
+						var checkboxes = container.querySelectorAll('input[type="checkbox"]:checked');
+						var summary = container.querySelector('summary');
+						var count = checkboxes.length;
 						if (summary.textContent.includes('выбрано')) {
 							summary.textContent = summary.textContent.replace(/\d+ выбрано/, count + ' выбрано');
 						} else {
-							summary.textContent = 'Выберите устройства (' + count + ' выбрано)';
+							summary.textContent = 'Выбрать устройства (' + count + ' выбрано)';
 						}
 					}
 				}
 			});
 		}
 
-		// Функции управления расписанием
+		// Функция генерации уникального ID
+		function generateScheduleId() {
+			return 'schedule_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+		}
+
+		// Функция проверки пересечения двух расписаний
+		function schedulesOverlap(s1, s2) {
+			var start1 = s1.start_hour * 60 + s1.start_min;
+			var end1 = s1.end_hour * 60 + s1.end_min;
+			var start2 = s2.start_hour * 60 + s2.start_min;
+			var end2 = s2.end_hour * 60 + s2.end_min;
+
+			// Нормализуем интервалы через полночь
+			if (start1 > end1) {
+				if (start2 > end2) {
+					return true; // Оба через полночь - пересекаются всегда
+				}
+				return start2 < end1 || end2 > start1;
+			}
+
+			if (start2 > end2) {
+				return start1 < end2 || end1 > start2;
+			}
+
+			// Оба интервала обычные
+			return !(end1 <= start2 || end2 <= start1);
+		}
+
+		// Функция валидации расписаний
+		function validateSchedules(schedules) {
+			var enabled = schedules.filter(function(s) { return s.enabled; });
+
+			for (var i = 0; i < enabled.length; i++) {
+				for (var j = i + 1; j < enabled.length; j++) {
+					if (schedulesOverlap(enabled[i], enabled[j])) {
+						return 'Расписания пересекаются: "' + (enabled[i].id || 'ID' + (i+1)) + '" и "' + (enabled[j].id || 'ID' + (j+1)) + '"';
+					}
+				}
+			}
+			return null;
+		}
+
+		// Функция открытия модального окна расписаний
 		function openScheduleModal(groupName) {
-			const modal = document.getElementById('scheduleModal');
+			currentGroupName = groupName;
 			document.getElementById('modalGroupName').value = groupName;
 			document.getElementById('scheduleGroupName').textContent = groupName;
 
-			// Заполняем селекты времени
-			populateTimeSelects();
-
-			// Загружаем текущие данные расписания
-			fetch('/api/schedule/' + groupName)
-				.then(response => response.json())
-				.then(data => {
-					document.getElementById('scheduleEnabled').checked = data.enabled || false;
-					document.getElementById('startHour').value = data.start_hour || 0;
-					document.getElementById('startMin').value = data.start_min || 0;
-					document.getElementById('endHour').value = data.end_hour || 23;
-					document.getElementById('endMin').value = data.end_min || 0;
+			// Загружаем расписания с сервера
+			fetch('/api/schedules/' + encodeURIComponent(groupName))
+				.then(function(response) { return response.json(); })
+				.then(function(data) {
+					currentSchedules = data || [];
+					renderSchedulesList();
+					document.getElementById('scheduleModal').style.display = 'block';
 				})
-				.catch(error => {
-					console.error('Error loading schedule:', error);
-				});
-
-			modal.style.display = 'block';
-		}
-
-		function closeScheduleModal() {
-			document.getElementById('scheduleModal').style.display = 'none';
-		}
-
-		function populateTimeSelects() {
-			const hourSelects = ['startHour', 'endHour'];
-			const minSelects = ['startMin', 'endMin'];
-
-			hourSelects.forEach(id => {
-				const select = document.getElementById(id);
-				select.innerHTML = '';
-				for(let i = 0; i < 24; i++) {
-					select.innerHTML += '<option value="' + i + '">' + i.toString().padStart(2, '0') + '</option>';
-				}
-			});
-
-			minSelects.forEach(id => {
-				const select = document.getElementById(id);
-				select.innerHTML = '';
-				for(let i = 0; i < 60; i++) {
-					select.innerHTML += '<option value="' + i + '">' + i.toString().padStart(2, '0') + '</option>';
-				}
-			});
-		}
-
-		function saveSchedule() {
-			const formData = new FormData(document.getElementById('scheduleForm'));
-			fetch('/api/schedule-save', {method: 'POST', body: formData})
-				.then(response => response.json())
-				.then(data => {
-					if (data.level === 'success') {
-						closeScheduleModal();
-						showStatus('Расписание сохранено', 'success');
-						setTimeout(() => location.reload(), 1000);
-					} else {
-						showStatus(data.desc, 'error');
-					}
-				})
-				.catch(error => {
-					console.error('Error saving schedule:', error);
-					showStatus('Ошибка сохранения расписания', 'error');
+				.catch(function(error) {
+					console.error('Error loading schedules:', error);
+					currentSchedules = [];
+					renderSchedulesList();
+					document.getElementById('scheduleModal').style.display = 'block';
 				});
 		}
 
-		function toggleSchedule(groupName, enabled) {
-			fetch('/api/schedule-toggle', {
+		// Функция отображения списка расписаний
+		function renderSchedulesList() {
+			var container = document.getElementById('schedulesList');
+
+			if (currentSchedules.length === 0) {
+				container.innerHTML = '<p style="color: var(--text-secondary); font-style: italic; padding: 20px; text-align: center;">Расписания не созданы. Добавьте первое расписание.</p>';
+				return;
+			}
+
+			// Сортируем расписания по времени начала
+			var sortedSchedules = currentSchedules.slice().sort(function(a, b) {
+				var timeA = a.start_hour * 60 + a.start_min;
+				var timeB = b.start_hour * 60 + b.start_min;
+				return timeA - timeB;
+			});
+
+			var html = '';
+			sortedSchedules.forEach(function(schedule) {
+				// Находим оригинальный индекс для операций редактирования/удаления
+				var originalIndex = currentSchedules.indexOf(schedule);
+
+				var timeText = String(schedule.start_hour).padStart(2, '0') + ':' + String(schedule.start_min).padStart(2, '0') +
+					' — ' + String(schedule.end_hour).padStart(2, '0') + ':' + String(schedule.end_min).padStart(2, '0');
+
+				html += '<div class="schedule-item' + (schedule.enabled ? '' : ' disabled') + '">' +
+					'<div class="schedule-item-header">' +
+					'<div class="schedule-item-title">' +
+					'<label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">' +
+					'<input type="checkbox" ' + (schedule.enabled ? 'checked' : '') + ' ' +
+					'onchange="toggleScheduleItem(' + originalIndex + ', this.checked)" style="width: auto; margin: 0;">' +
+					'<span>' + timeText + '</span>' +
+					'</label>' +
+					'</div>' +
+					'<div class="schedule-item-actions">' +
+					'<button type="button" class="btn btn-primary btn-small" onclick="editScheduleItem(' + originalIndex + ')">Изменить</button>' +
+					'<button type="button" class="btn btn-danger btn-small" onclick="deleteScheduleItem(' + originalIndex + ')">Удалить</button>' +
+					'</div>' +
+					'</div>' +
+					'<div style="font-size: 12px; color: var(--text-secondary); margin-top: 4px;">' +
+					'Фильтр отключается в указанное время' +
+					'</div>' +
+					'</div>';
+			});
+
+			container.innerHTML = html;
+		}
+
+		// Функция добавления нового расписания
+		function addNewSchedule() {
+			var newSchedule = {
+				id: generateScheduleId(),
+				enabled: true,
+				start_hour: 0,
+				start_min: 0,
+				end_hour: 23,
+				end_min: 0,
+				_isNew: true
+			};
+
+			currentSchedules.push(newSchedule);
+			editScheduleItem(currentSchedules.length - 1);
+		}
+
+		// Функция редактирования расписания
+		function editScheduleItem(index) {
+			var schedule = currentSchedules[index];
+
+			var html = '<div style="background: var(--card-bg); padding: 16px; border: 2px solid var(--primary-color); border-radius: 8px;">' +
+				'<h4 style="margin-bottom: 16px;">Редактирование расписания</h4>' +
+				'<div class="form-group">' +
+				'<label>' +
+				'<input type="checkbox" id="editEnabled" ' + (schedule.enabled ? 'checked' : '') + ' style="width: auto; margin-right: 8px;">' +
+				'Включено' +
+				'</label>' +
+				'</div>' +
+				'<div class="form-group">' +
+				'<label>Время отключения фильтра:</label>' +
+				'<div class="time-inputs">' +
+				'<div class="time-group">' +
+				'<span>С</span>' +
+				'<select id="editStartHour" class="time-select"></select>' +
+				'<span>:</span>' +
+				'<select id="editStartMin" class="time-select"></select>' +
+				'</div>' +
+				'<div class="time-group">' +
+				'<span>по</span>' +
+				'<select id="editEndHour" class="time-select"></select>' +
+				'<span>:</span>' +
+				'<select id="editEndMin" class="time-select"></select>' +
+				'</div>' +
+				'</div>' +
+				'</div>' +
+				'<div style="display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px;">' +
+				'<button type="button" class="btn btn-secondary btn-small" onclick="cancelEditScheduleItem()">Отмена</button>' +
+				'<button type="button" class="btn btn-success btn-small" onclick="saveScheduleItem(' + index + ')">Сохранить</button>' +
+				'</div>' +
+				'</div>';
+
+			var container = document.getElementById('schedulesList');
+			container.innerHTML = html;
+
+			// Заполняем селекты
+			populateTimeSelect('editStartHour', 24, schedule.start_hour);
+			populateTimeSelect('editStartMin', 60, schedule.start_min);
+			populateTimeSelect('editEndHour', 24, schedule.end_hour);
+			populateTimeSelect('editEndMin', 60, schedule.end_min);
+		}
+
+		// Вспомогательная функция для заполнения селекта времени
+		function populateTimeSelect(id, max, selected) {
+			var select = document.getElementById(id);
+			select.innerHTML = '';
+			for (var i = 0; i < max; i++) {
+				var option = document.createElement('option');
+				option.value = i;
+				option.textContent = String(i).padStart(2, '0');
+				if (i === selected) option.selected = true;
+				select.appendChild(option);
+			}
+		}
+
+		// Функция сохранения изменений расписания
+		function saveScheduleItem(index) {
+			currentSchedules[index] = {
+				id: currentSchedules[index].id,
+				enabled: document.getElementById('editEnabled').checked,
+				start_hour: parseInt(document.getElementById('editStartHour').value),
+				start_min: parseInt(document.getElementById('editStartMin').value),
+				end_hour: parseInt(document.getElementById('editEndHour').value),
+				end_min: parseInt(document.getElementById('editEndMin').value)
+				// Удаляем флаг _isNew при сохранении
+			};
+
+			// Валидация
+			var error = validateSchedules(currentSchedules);
+			if (error) {
+				showStatus(error, 'error');
+				return;
+			}
+
+			// Сохраняем на сервер
+			saveSchedulesToServer();
+		}
+
+		// Функция отмены редактирования
+		function cancelEditScheduleItem() {
+			// Если это новое несохраненное расписание, удаляем его
+			var scheduleToRemove = -1;
+			for (var i = 0; i < currentSchedules.length; i++) {
+				if (currentSchedules[i]._isNew) {
+					scheduleToRemove = i;
+					break;
+				}
+			}
+
+			if (scheduleToRemove !== -1) {
+				currentSchedules.splice(scheduleToRemove, 1);
+			}
+
+			renderSchedulesList();
+		}
+
+		// Функция переключения статуса расписания
+		function toggleScheduleItem(index, enabled) {
+			currentSchedules[index].enabled = enabled;
+
+			// Валидация
+			var error = validateSchedules(currentSchedules);
+			if (error) {
+				showStatus(error, 'error');
+				// Возвращаем предыдущее состояние
+				currentSchedules[index].enabled = !enabled;
+				renderSchedulesList();
+				return;
+			}
+
+			saveSchedulesToServer();
+		}
+
+		// Функция удаления расписания
+		function deleteScheduleItem(index) {
+			if (!confirm('Удалить это расписание?')) {
+				return;
+			}
+
+			currentSchedules.splice(index, 1);
+			saveSchedulesToServer();
+		}
+
+		// Функция сохранения всех расписаний на сервер
+		function saveSchedulesToServer() {
+			var formData = new FormData();
+			formData.append('group_name', currentGroupName);
+			formData.append('schedules', JSON.stringify(currentSchedules));
+
+			fetch('/api/schedules-save', {
 				method: 'POST',
-				headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-				body: 'group=' + encodeURIComponent(groupName) + '&enabled=' + enabled
+				body: formData
 			})
-			.then(response => response.json())
-			.then(data => {
+			.then(function(response) { return response.json(); })
+			.then(function(data) {
 				if (data.level === 'success') {
 					showStatus(data.desc, 'success');
-					setTimeout(() => location.reload(), 1000);
+					renderSchedulesList();
 				} else {
 					showStatus(data.desc, 'error');
 				}
 			})
-			.catch(error => {
-				console.error('Error toggling schedule:', error);
-				showStatus('Ошибка переключения расписания', 'error');
+			.catch(function(error) {
+				console.error('Error saving schedules:', error);
+				showStatus('Ошибка сохранения расписаний', 'error');
 			});
 		}
 
-		function updateScheduleTooltip(checkbox) {
-			const label = checkbox.closest('label');
-			if (checkbox.checked) {
-				label.setAttribute('title', 'Выключить расписание');
-			} else {
-				label.setAttribute('title', 'Включить расписание');
-			}
+		function closeScheduleModal() {
+			document.getElementById('scheduleModal').style.display = 'none';
+			setTimeout(function() { location.reload(); }, 500);
 		}
 
 		function removeDevice(deviceName) {
@@ -4093,14 +4551,14 @@ const htmlTemplate = `
 				headers: {'Content-Type': 'application/x-www-form-urlencoded'},
 				body: new URLSearchParams({device: deviceName})
 			})
-			.then(res => res.json())
-			.then(data => {
+			.then(function(res) { return res.json(); })
+			.then(function(data) {
 				showStatus(data.desc, data.level);
 				if (data.level === 'success') {
-					setTimeout(() => location.reload(), 1000);
+					setTimeout(function() { location.reload(); }, 1000);
 				}
 			})
-			.catch(err => {
+			.catch(function(err) {
 				showStatus('Ошибка: ' + err.message, 'error');
 			});
 		}
@@ -4110,10 +4568,10 @@ const htmlTemplate = `
 
 			// Загружаем текущие настройки
 			fetch('/api/disable-action/' + groupName)
-				.then(response => response.json())
-				.then(data => {
-					const modeRadios = document.getElementsByName('mode');
-					modeRadios.forEach(radio => {
+				.then(function(response) { return response.json(); })
+				.then(function(data) {
+					var modeRadios = document.getElementsByName('mode');
+					modeRadios.forEach(function(radio) {
 						radio.checked = radio.value === (data.mode || 'remove');
 					});
 
@@ -4123,7 +4581,7 @@ const htmlTemplate = `
 
 					toggleTagSelect();
 				})
-				.catch(error => {
+				.catch(function(error) {
 					console.error('Error loading disable action:', error);
 				});
 
@@ -4135,8 +4593,8 @@ const htmlTemplate = `
 		}
 
 		function toggleTagSelect() {
-			const switchMode = document.querySelector('input[name="mode"][value="switch"]').checked;
-			const tagGroup = document.getElementById('alternativeTagGroup');
+			var switchMode = document.querySelector('input[name="mode"][value="switch"]').checked;
+			var tagGroup = document.getElementById('alternativeTagGroup');
 			tagGroup.style.display = switchMode ? 'block' : 'none';
 
 			if (!switchMode) {
@@ -4145,7 +4603,7 @@ const htmlTemplate = `
 		}
 
 		function saveDisableAction() {
-			const formData = new FormData(document.getElementById('disableActionForm'));
+			var formData = new FormData(document.getElementById('disableActionForm'));
 
 			// Если выбран режим "remove", очищаем поле тега
 			if (formData.get('mode') === 'remove') {
@@ -4153,17 +4611,17 @@ const htmlTemplate = `
 			}
 
 			fetch('/api/disable-action-save', {method: 'POST', body: formData})
-				.then(response => response.json())
-				.then(data => {
+				.then(function(response) { return response.json(); })
+				.then(function(data) {
 					if (data.level === 'success') {
 						closeDisableActionModal();
 						showStatus('Настройки действия сохранены', 'success');
-						setTimeout(() => location.reload(), 1000);
+						setTimeout(function() { location.reload(); }, 1000);
 					} else {
 						showStatus(data.desc, 'error');
 					}
 				})
-				.catch(error => {
+				.catch(function(error) {
 					console.error('Error saving disable action:', error);
 					showStatus('Ошибка сохранения настроек', 'error');
 				});
@@ -4172,21 +4630,20 @@ const htmlTemplate = `
 		function openLeasetimeModal(groupName) {
 			document.getElementById('leasetimeGroupName').value = groupName;
 
-			// Сразу сбрасываем на дефолт (это предотвратит показ старых значений)
-			const modeRadios = document.getElementsByName('mode');
-			modeRadios.forEach(radio => {
+			// Сразу сбрасываем на дефолт
+			var modeRadios = document.getElementsByName('mode');
+			modeRadios.forEach(function(radio) {
 				radio.checked = radio.value === 'default';
 			});
 			document.getElementById('leasetimeValue').value = 5;
 			document.getElementById('leasetimeInputGroup').style.display = 'none';
 
-			// Загружаем актуальные данные для конкретной группы
+			// Загружаем актуальные данные
 			fetch('/api/leasetime/' + encodeURIComponent(groupName))
-				.then(response => response.json())
-				.then(data => {
-					// Применяем загруженные данные
-					const modeRadios = document.getElementsByName('mode');
-					modeRadios.forEach(radio => {
+				.then(function(response) { return response.json(); })
+				.then(function(data) {
+					var modeRadios = document.getElementsByName('mode');
+					modeRadios.forEach(function(radio) {
 						radio.checked = radio.value === (data.mode || 'default');
 					});
 
@@ -4196,21 +4653,19 @@ const htmlTemplate = `
 
 					toggleLeasetimeInput();
 				})
-				.catch(error => {
+				.catch(function(error) {
 					console.error('Error loading leasetime:', error);
-					// При ошибке остаются дефолтные значения из ШАГа 1
 				});
 
-			// Показываем модальное окно
 			document.getElementById('leasetimeModal').style.display = 'block';
 		}
 
 		function closeLeasetimeModal() {
 			document.getElementById('leasetimeModal').style.display = 'none';
 
-			// Сбрасываем форму при закрытии
-			const modeRadios = document.getElementsByName('mode');
-			modeRadios.forEach(radio => {
+			// Сбрасываем форму
+			var modeRadios = document.getElementsByName('mode');
+			modeRadios.forEach(function(radio) {
 				radio.checked = radio.value === 'default';
 			});
 			document.getElementById('leasetimeValue').value = 5;
@@ -4218,13 +4673,13 @@ const htmlTemplate = `
 		}
 
 		function toggleLeasetimeInput() {
-			const customMode = document.querySelector('input[name="mode"][value="custom"]').checked;
-			const inputGroup = document.getElementById('leasetimeInputGroup');
+			var customMode = document.querySelector('input[name="mode"][value="custom"]').checked;
+			var inputGroup = document.getElementById('leasetimeInputGroup');
 			inputGroup.style.display = customMode ? 'block' : 'none';
 		}
 
 		function saveLeasetime() {
-			const formData = new FormData(document.getElementById('leasetimeForm'));
+			var formData = new FormData(document.getElementById('leasetimeForm'));
 
 			// Если выбран режим "default", очищаем поле leasetime
 			if (formData.get('mode') === 'default') {
@@ -4232,35 +4687,35 @@ const htmlTemplate = `
 			}
 
 			fetch('/api/leasetime-save', {method: 'POST', body: formData})
-				.then(response => response.json())
-				.then(data => {
+				.then(function(response) { return response.json(); })
+				.then(function(data) {
 					if (data.level === 'success') {
 						closeLeasetimeModal();
 						showStatus('Настройки срока аренды сохранены', 'success');
-						setTimeout(() => location.reload(), 1000);
+						setTimeout(function() { location.reload(); }, 1000);
 					} else {
 						showStatus(data.desc, 'error');
 					}
 				})
-				.catch(error => {
+				.catch(function(error) {
 					console.error('Error saving leasetime:', error);
 					showStatus('Ошибка сохранения настроек', 'error');
 				});
 		}
 
 		function saveAdGuardSettings() {
-			const form = document.getElementById('adguardForm');
-			const formData = new FormData(form);
+			var form = document.getElementById('adguardForm');
+			var formData = new FormData(form);
 
 			fetch('/api/adguard-settings', {method: 'POST', body: formData})
-				.then(response => response.json())
-				.then(data => {
+				.then(function(response) { return response.json(); })
+				.then(function(data) {
 					showStatus(data.desc, data.level);
 					if (data.level === 'success') {
-						setTimeout(() => location.reload(), 1000);
+						setTimeout(function() { location.reload(); }, 1000);
 					}
 				})
-				.catch(error => {
+				.catch(function(error) {
 					console.error('Error saving AdGuard settings:', error);
 					showStatus('Ошибка сохранения настроек', 'error');
 				});
@@ -4268,11 +4723,11 @@ const htmlTemplate = `
 
 		function testAdGuardConnection() {
 			fetch('/api/adguard-test')
-				.then(response => response.json())
-				.then(data => {
+				.then(function(response) { return response.json(); })
+				.then(function(data) {
 					showStatus(data.desc, data.level);
 				})
-				.catch(error => {
+				.catch(function(error) {
 					console.error('Error testing AdGuard connection:', error);
 					showStatus('Ошибка проверки подключения', 'error');
 				});
@@ -4281,94 +4736,87 @@ const htmlTemplate = `
 		function handleToggleChange(event, groupName) {
 			event.preventDefault();
 
-			const checkbox = event.target;
-			const form = checkbox.closest('form');
-			const formData = new FormData(form);
+			var checkbox = event.target;
+			var form = checkbox.closest('form');
+			var formData = new FormData(form);
 
 			fetch('/api/toggle', {
 				method: 'POST',
 				body: formData
 			})
-			.then(response => response.json())
-			.then(data => {
+			.then(function(response) { return response.json(); })
+			.then(function(data) {
 				if (data.level === 'success') {
 					showStatus(data.desc, 'success');
-					setTimeout(() => window.location.href = '/', 1000);
+					setTimeout(function() { window.location.href = '/'; }, 1000);
 				} else {
 					showStatus(data.desc, 'error');
-					// Возвращаем чекбокс в предыдущее состояние при ошибке
 					checkbox.checked = !checkbox.checked;
 				}
 			})
-			.catch(error => {
+			.catch(function(error) {
 				console.error('Error:', error);
 				showStatus('Произошла ошибка при переключении группы', 'error');
-				// Возвращаем чекбокс в предыдущее состояние при ошибке
 				checkbox.checked = !checkbox.checked;
 			});
 		}
 
-		// Обработчик для формы создания тега
 		function handleTagFormSubmit(form, event) {
 			event.preventDefault();
 
-			const formData = new FormData(form);
-			const action = form.getAttribute('action');
+			var formData = new FormData(form);
+			var action = form.getAttribute('action');
 
 			fetch(action, {
 				method: 'POST',
 				body: formData
 			})
-			.then(response => response.json())
-			.then(data => {
+			.then(function(response) { return response.json(); })
+			.then(function(data) {
 				if (data.level === 'success') {
 					showStatus(data.desc, 'success');
-					// Перенаправляем на главную страницу без параметров
-					setTimeout(() => window.location.href = '/', 1000);
+					setTimeout(function() { window.location.href = '/'; }, 1000);
 				} else {
 					showStatus(data.desc, 'error');
 				}
 			})
-			.catch(error => {
+			.catch(function(error) {
 				console.error('Error:', error);
 				showStatus('Произошла ошибка при сохранении тега', 'error');
 			});
 		}
 
-		// Обработчик для формы создания группы
 		function handleGroupFormSubmit(form, event) {
 			event.preventDefault();
 
-			const formData = new FormData(form);
-			const action = form.getAttribute('action');
+			var formData = new FormData(form);
+			var action = form.getAttribute('action');
 
 			fetch(action, {
 				method: 'POST',
 				body: formData
 			})
-			.then(response => response.json())
-			.then(data => {
+			.then(function(response) { return response.json(); })
+			.then(function(data) {
 				if (data.level === 'success') {
 					showStatus(data.desc, 'success');
-					// Перенаправляем на главную страницу без параметров
-					setTimeout(() => window.location.href = '/', 1000);
+					setTimeout(function() { window.location.href = '/'; }, 1000);
 				} else {
 					showStatus(data.desc, 'error');
 				}
 			})
-			.catch(error => {
+			.catch(function(error) {
 				console.error('Error:', error);
 				showStatus('Произошла ошибка при сохранении группы', 'error');
 			});
 		}
 
 		function editGroup(groupName) {
-			// Создаем форму для редактирования
-			const form = document.createElement('form');
+			var form = document.createElement('form');
 			form.method = 'GET';
 			form.action = '/';
 
-			const input = document.createElement('input');
+			var input = document.createElement('input');
 			input.type = 'hidden';
 			input.name = 'edit';
 			input.value = groupName;
@@ -4379,11 +4827,11 @@ const htmlTemplate = `
 		}
 
 		function editTag(tagName) {
-			const form = document.createElement('form');
+			var form = document.createElement('form');
 			form.method = 'GET';
 			form.action = '/';
 
-			const input = document.createElement('input');
+			var input = document.createElement('input');
 			input.type = 'hidden';
 			input.name = 'edittag';
 			input.value = tagName;
@@ -4393,27 +4841,25 @@ const htmlTemplate = `
 			form.submit();
 		}
 
-		// Обработчик для формы фильтр листа
 		function handleFilterFormSubmit(form, event) {
 			event.preventDefault();
 
-			const formData = new FormData(form);
+			var formData = new FormData(form);
 
 			fetch('/api/save-filter', {
 				method: 'POST',
 				body: formData
 			})
-			.then(response => response.json())
-			.then(data => {
+			.then(function(response) { return response.json(); })
+			.then(function(data) {
 				if (data.level === 'success') {
 					showStatus(data.desc, 'success');
-					// Перезагружаем страницу для обновления ссылки на файл
-					setTimeout(() => location.reload(), 1000);
+					setTimeout(function() { location.reload(); }, 1000);
 				} else {
 					showStatus(data.desc, 'error');
 				}
 			})
-			.catch(error => {
+			.catch(function(error) {
 				console.error('Error:', error);
 				showStatus('Произошла ошибка при сохранении фильтра', 'error');
 			});
@@ -4421,9 +4867,9 @@ const htmlTemplate = `
 
 		// Закрытие модальных окон по клику вне их
 		window.onclick = function(event) {
-			const scheduleModal = document.getElementById('scheduleModal');
-			const disableActionModal = document.getElementById('disableActionModal');
-			const leasetimeModal = document.getElementById('leasetimeModal');
+			var scheduleModal = document.getElementById('scheduleModal');
+			var disableActionModal = document.getElementById('disableActionModal');
+			var leasetimeModal = document.getElementById('leasetimeModal');
 
 			if (event.target === scheduleModal) {
 				closeScheduleModal();
@@ -4438,12 +4884,11 @@ const htmlTemplate = `
 			}
 		}
 
-		// Обработчик для формы удаления тега
 		function handleDeleteTagSubmit(form, event) {
 			event.preventDefault();
 
-			const formData = new FormData(form);
-			const tagName = formData.get('tag_name');
+			var formData = new FormData(form);
+			var tagName = formData.get('tag_name');
 
 			if (!confirm('Удалить тег ' + tagName + '?')) {
 				return;
@@ -4453,16 +4898,16 @@ const htmlTemplate = `
 				method: 'POST',
 				body: formData
 			})
-			.then(response => response.json())
-			.then(data => {
+			.then(function(response) { return response.json(); })
+			.then(function(data) {
 				if (data.level === 'success') {
 					showStatus(data.desc, 'success');
-					setTimeout(() => location.reload(), 1000);
+					setTimeout(function() { location.reload(); }, 1000);
 				} else {
 					showStatus(data.desc, 'error');
 				}
 			})
-			.catch(error => {
+			.catch(function(error) {
 				console.error('Error:', error);
 				showStatus('Произошла ошибка при удалении тега', 'error');
 			});
@@ -4486,48 +4931,48 @@ const htmlTemplate = `
 			});
 
 			// Привязываем обработчики к формам создания тегов
-			const tagForms = document.querySelectorAll('form[action="/api/create-tag"]');
-			tagForms.forEach(form => {
+			var tagForms = document.querySelectorAll('form[action="/api/create-tag"]');
+			tagForms.forEach(function(form) {
 				form.addEventListener('submit', function(event) {
 					handleTagFormSubmit(this, event);
 				});
 			});
 
 			// Привязываем обработчики к формам удаления тегов
-			const deleteTagForms = document.querySelectorAll('form[action="/api/delete-tag"]');
-			deleteTagForms.forEach(form => {
+			var deleteTagForms = document.querySelectorAll('form[action="/api/delete-tag"]');
+			deleteTagForms.forEach(function(form) {
 				form.addEventListener('submit', function(event) {
 					handleDeleteTagSubmit(this, event);
 				});
 			});
 
 			// Привязываем обработчики к формам удаления групп
-			const deleteGroupForms = document.querySelectorAll('form[action="/api/delete-group"]');
-			deleteGroupForms.forEach(form => {
+			var deleteGroupForms = document.querySelectorAll('form[action="/api/delete-group"]');
+			deleteGroupForms.forEach(function(form) {
 				form.addEventListener('submit', function(event) {
-					const groupName = this.querySelector('input[name="group_name"]').value;
+					var groupName = this.querySelector('input[name="group_name"]').value;
 					if (!confirm('Удалить группу ' + groupName + '?')) {
 						event.preventDefault();
 						return false;
 					}
 
 					event.preventDefault();
-					const formData = new FormData(this);
+					var formData = new FormData(this);
 
 					fetch('/api/delete-group', {
 						method: 'POST',
 						body: formData
 					})
-					.then(response => response.json())
-					.then(data => {
+					.then(function(response) { return response.json(); })
+					.then(function(data) {
 						if (data.level === 'success') {
 							showStatus(data.desc, 'success');
-							setTimeout(() => location.reload(), 1000);
+							setTimeout(function() { location.reload(); }, 1000);
 						} else {
 							showStatus(data.desc, 'error');
 						}
 					})
-					.catch(error => {
+					.catch(function(error) {
 						console.error('Error:', error);
 						showStatus('Произошла ошибка при удалении группы', 'error');
 					});
@@ -4535,32 +4980,32 @@ const htmlTemplate = `
 			});
 
 			// Привязываем обработчики к формам создания групп
-			const groupForms = document.querySelectorAll('form[action="/api/create-group"]');
-			groupForms.forEach(form => {
+			var groupForms = document.querySelectorAll('form[action="/api/create-group"]');
+			groupForms.forEach(function(form) {
 				form.addEventListener('submit', function(event) {
 					handleGroupFormSubmit(this, event);
 				});
 			});
 
 			// Привязываем обработчики к формам редактирования групп
-			const updateGroupForms = document.querySelectorAll('form[action="/api/update-group"]');
-			updateGroupForms.forEach(form => {
+			var updateGroupForms = document.querySelectorAll('form[action="/api/update-group"]');
+			updateGroupForms.forEach(function(form) {
 				form.addEventListener('submit', function(event) {
 					handleGroupFormSubmit(this, event);
 				});
 			});
 
 			// Привязываем обработчики к формам редактирования тегов
-			const updateTagForms = document.querySelectorAll('form[action="/api/update-tag"]');
-			updateTagForms.forEach(form => {
+			var updateTagForms = document.querySelectorAll('form[action="/api/update-tag"]');
+			updateTagForms.forEach(function(form) {
 				form.addEventListener('submit', function(event) {
 					handleTagFormSubmit(this, event);
 				});
 			});
 
 			// Привязываем обработчики к форме сохранения фильтра
-			const filterForms = document.querySelectorAll('form[action="/api/save-filter"]');
-			filterForms.forEach(form => {
+			var filterForms = document.querySelectorAll('form[action="/api/save-filter"]');
+			filterForms.forEach(function(form) {
 				form.addEventListener('submit', function(event) {
 					handleFilterFormSubmit(this, event);
 				});
@@ -4569,40 +5014,85 @@ const htmlTemplate = `
 			// Show messages
 			{{if .Message}}showStatus('{{.Message}}', 'success');{{end}}
 			{{if .Error}}showStatus('{{.Error}}', 'error');{{end}}
+
+			// Обновление счетчика активных расписаний и их отображение
+			function updateScheduleCounts() {
+				document.querySelectorAll('.schedule-status[data-group]').forEach(function(statusDiv) {
+					var groupName = statusDiv.getAttribute('data-group');
+
+					fetch('/api/schedules/' + encodeURIComponent(groupName))
+						.then(function(response) { return response.json(); })
+						.then(function(schedules) {
+							var enabled = schedules.filter(function(s) { return s.enabled; }).length;
+							var infoSpan = statusDiv.querySelector('.schedules-enabled-info');
+							if (infoSpan) {
+								infoSpan.textContent = ' (активных: ' + enabled + ')';
+							}
+
+							// Сортируем расписания по времени начала
+							var sortedSchedules = schedules.slice().sort(function(a, b) {
+								var timeA = a.start_hour * 60 + a.start_min;
+								var timeB = b.start_hour * 60 + b.start_min;
+								return timeA - timeB;
+							});
+
+							// Отображаем список расписаний
+							var previewContainer = statusDiv.parentElement.querySelector('.schedules-preview[data-group="' + groupName + '"]');
+							if (previewContainer && sortedSchedules.length > 0) {
+								var html = '';
+								sortedSchedules.forEach(function(schedule) {
+									var startTime = String(schedule.start_hour).padStart(2, '0') + ':' + String(schedule.start_min).padStart(2, '0');
+									var endTime = String(schedule.end_hour).padStart(2, '0') + ':' + String(schedule.end_min).padStart(2, '0');
+									var disabledClass = schedule.enabled ? '' : ' disabled';
+
+									html += '<div class="schedule-preview-item' + disabledClass + '">' +
+										'<span class="schedule-preview-icon"></span>' +
+										'<span>' + startTime + ' — ' + endTime + '</span>' +
+										'</div>';
+								});
+								previewContainer.innerHTML = html;
+							}
+						})
+						.catch(function(error) {
+							console.error('Error loading schedules for', groupName, error);
+						});
+				});
+			}
+
+			// Вызываем при загрузке страницы
+			updateScheduleCounts();
 		});
 
 		(function() {
-			const urlParams = new URLSearchParams(window.location.search);
-			const justLoggedIn = document.referrer.includes('/login') || urlParams.has('login');
+			var urlParams = new URLSearchParams(window.location.search);
+			var justLoggedIn = document.referrer.includes('/login') || urlParams.has('login');
 
 			{{if not .Connected}}
 			{{if .Settings.AutoConnect}}
 			{{if .Settings.SSHHost}}
-			// Проверяем, только что ли был вход
 			if (justLoggedIn || sessionStorage.getItem('autoconnect_pending') === 'true') {
 				sessionStorage.setItem('autoconnect_pending', 'true');
 
-				let attempts = 0;
-				const maxAttempts = 10; // 10 попыток × 500ms = 5 секунд
+				var attempts = 0;
+				var maxAttempts = 10;
 
 				function checkConnection() {
 					attempts++;
 
 					fetch('/api/status')
-						.then(r => r.json())
-						.then(data => {
+						.then(function(r) { return r.json(); })
+						.then(function(data) {
 							if (data.connected) {
 								sessionStorage.removeItem('autoconnect_pending');
 								location.reload();
 							} else if (attempts < maxAttempts) {
 								setTimeout(checkConnection, 500);
 							} else {
-								// Превышено время ожидания
 								sessionStorage.removeItem('autoconnect_pending');
 								console.log('SSH auto-connect timeout');
 							}
 						})
-						.catch(err => {
+						.catch(function(err) {
 							console.error('Connection check failed:', err);
 							if (attempts < maxAttempts) {
 								setTimeout(checkConnection, 500);
@@ -4610,8 +5100,7 @@ const htmlTemplate = `
 						});
 				}
 
-				// Показываем индикатор подключения
-				const indicator = document.createElement('div');
+				var indicator = document.createElement('div');
 				indicator.id = 'connection-indicator';
 				indicator.textContent = 'Подключение к роутеру...';
 				document.body.appendChild(indicator);
