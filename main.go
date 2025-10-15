@@ -135,7 +135,7 @@ type GroupConfig struct {
 	Tag           string               `json:"tag"`
 	Schedules     []Schedule           `json:"schedules,omitempty"`
 	DisableAction *FilterDisableAction `json:"disable_action,omitempty"`
-	Leasetime     *int                 `json:"leasetime,omitempty"` // TTL в минутах, nil = по умолчанию
+	Leasetime     *int                 `json:"leasetime,omitempty"` // DHCP Lease Time в минутах, nil = по умолчанию
 }
 
 type Schedule struct {
@@ -685,7 +685,7 @@ func (om *OpenWrtManager) ensureConnection() error {
 			addLog(fmt.Sprintf("Warning: Failed to sync tags: %v", syncErr), "warning")
 		}
 
-		// Синхронизация TTL
+		// Синхронизация DHCP Lease Time
 		if syncErr := om.syncLeasetimeFromOpenWrt(); syncErr != nil {
 			addLog(fmt.Sprintf("Warning: Failed to sync leasetime: %v", syncErr), "warning")
 		}
@@ -3856,7 +3856,7 @@ const htmlTemplate = `
 							<button type="button" class="btn btn-secondary btn-small"
 									onclick="openLeasetimeModal('{{$group}}')"
 									style="font-size: 12px; padding: 4px 8px;">
-								TTL (срок аренды)
+								DHCP (срок аренды)
 							</button>
 						</div>
 					</div>
@@ -4095,13 +4095,15 @@ const htmlTemplate = `
 	<div id="scheduleModal" class="schedule-modal">
 		<div class="schedule-modal-content">
 			<h3>Настройка расписаний для группы "<span id="scheduleGroupName"></span>"</h3>
+
 			<p style="color: var(--text-secondary); font-size: 13px; margin-bottom: 16px;">
-				Фильтр будет автоматически отключаться в указанные периоды времени
+				Расписания определяют временные интервалы, когда фильтрация для этой группы будет <strong>автоматически отключаться</strong>.
+				Во всё остальное время фильтр будет <strong>включён</strong>.
 			</p>
 
 			<input type="hidden" id="modalGroupName" name="group_name">
 
-			<!-- Список существующих расписаний -->
+			<!-- Список расписаний -->
 			<div id="schedulesList" class="schedules-list"></div>
 
 			<div class="modal-actions">
@@ -4121,23 +4123,25 @@ const htmlTemplate = `
 				<div class="form-group">
 					<label style="display: flex; align-items: center; gap: 8px;">
 						<input type="radio" name="mode" value="remove" checked onchange="toggleTagSelect()" style="width: auto; margin: 0;">
-						<span>Удалять тег (поведение по умолчанию)</span>
+						<span>Удалить тег</span>
 					</label>
+					<small class="form-help">При отключении фильтра (по расписанию или вручную) тег будет удален с устройств. Устройства получат DNS по умолчанию.</small>
 				</div>
 
 				<div class="form-group">
 					<label style="display: flex; align-items: center; gap: 8px;">
 						<input type="radio" name="mode" value="switch" onchange="toggleTagSelect()" style="width: auto; margin: 0;">
-						<span>Переключать на другой тег</span>
+						<span>Переключить на другой тег</span>
 					</label>
+					<small class="form-help">При отключении фильтра тег будет заменен на другой, например, на менее строгий.</small>
 				</div>
 
 				<div class="form-group" id="alternativeTagGroup" style="display: none;">
 					<label>Альтернативный тег</label>
 					<select name="tag" id="alternativeTag">
-						<option value="">Выберите тег</option>
-						{{range $tag, $config := $.Settings.Tags}}
-						<option value="{{$tag}}">{{$tag}}</option>
+						<option value="">-- Выберите тег --</option>
+						{{range $tag, $config := .Settings.Tags}}
+							<option value="{{$tag}}">{{$tag}}</option>
 						{{end}}
 					</select>
 				</div>
@@ -4150,10 +4154,10 @@ const htmlTemplate = `
 		</div>
 	</div>
 
-	<!-- Модальное окно для настройки TTL -->
+	<!-- Модальное окно для настройки DHCP Lease Time -->
 	<div id="leasetimeModal" class="schedule-modal">
 		<div class="schedule-modal-content">
-			<h3 style="margin-bottom: 20px;">Настройка срока аренды DHCP (TTL)</h3>
+			<h3 style="margin-bottom: 20px;">Настройка срока аренды DHCP</h3>
 			<form id="leasetimeForm">
 				<input type="hidden" id="leasetimeGroupName" name="group_name">
 
@@ -4177,6 +4181,17 @@ const htmlTemplate = `
 						<input type="number" name="leasetime" id="leasetimeValue" min="0" max="60" value="5" style="width: 100px;">
 						<span>мин.</span>
 					</div>
+				</div>
+
+				<!-- Информационный блок -->
+				<div style="margin-top: 12px; background: rgba(59, 130, 246, 0.08); border: 1px solid rgba(59, 130, 246, 0.25); border-radius: 8px; padding: 12px;">
+					<p style="margin: 0 0 8px 0; color: var(--text-secondary); font-size: 13px;">
+						Этот параметр контролирует, как часто устройства будут запрашивать у роутера обновление сетевых настроек (включая DNS).
+					</p>
+					<ul style="margin: 0; padding-left: 18px; color: var(--text-secondary); font-size: 13px;">
+						<li><strong>Для быстрого применения фильтров (примерно 2,5 минуты):</strong> установите короткий срок, <strong>5 минут</strong> (T1 ≈ 50% от аренды, поэтому обновление происходит через ~2,5 мин).</li>
+						<li>Новое значение начнёт действовать после следующего продления текущей аренды на устройстве.</li>
+					</ul>
 				</div>
 
 				<div class="modal-actions">
