@@ -1015,32 +1015,37 @@ func validateSchedules(schedules []Schedule) error {
 // Проверка активности для массива расписаний
 func isFilterActiveBySchedules(schedules []Schedule) bool {
 	now := time.Now()
-	current := now.Hour()*minutesPerHour + now.Minute()
+	currentHour := now.Hour()
+	currentMin := now.Minute()
+	currentMinutes := currentHour*minutesPerHour + currentMin
 
 	for _, schedule := range schedules {
 		if !schedule.Enabled {
 			continue
 		}
 
-		start := schedule.StartHour*minutesPerHour + schedule.StartMin
-		end := schedule.EndHour*minutesPerHour + schedule.EndMin
+		startMinutes := schedule.StartHour*minutesPerHour + schedule.StartMin
+		endMinutes := schedule.EndHour*minutesPerHour + schedule.EndMin
 
-		inRange := (start <= end && current >= start && current < end) ||
-			(start > end && (current >= start || current < end))
-
-		if inRange {
-			// Если хотя бы одно расписание активно (время отключения), возвращаем false
-			return false
+		// Проверка попадания в интервал
+		if startMinutes <= endMinutes {
+			if currentMinutes >= startMinutes && currentMinutes < endMinutes {
+				return false
+			}
+		} else {
+			if currentMinutes >= startMinutes || currentMinutes < endMinutes {
+				return false
+			}
 		}
 	}
 
-	// Если ни одно расписание не активно, фильтр должен быть включен
+	// Если нет включенных расписаний, возвращаем false (фильтр неактивен)
 	return true
 }
 
 // Получение следующего перехода для массива расписаний
 func getNextScheduleTransition(schedules []Schedule, now time.Time) time.Time {
-	var nextTransition *time.Time
+	var nextTransition time.Time
 
 	for _, schedule := range schedules {
 		if !schedule.Enabled {
@@ -1051,50 +1056,58 @@ func getNextScheduleTransition(schedules []Schedule, now time.Time) time.Time {
 		startMinutes := schedule.StartHour*minutesPerHour + schedule.StartMin
 		endMinutes := schedule.EndHour*minutesPerHour + schedule.EndMin
 
-		var nextTransitionMinutes int
 		today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
 
-		if startMinutes <= endMinutes {
-			// Обычное расписание (в пределах одного дня)
-			if currentMinutes < startMinutes {
-				nextTransitionMinutes = startMinutes
-			} else if currentMinutes < endMinutes {
-				nextTransitionMinutes = endMinutes
-			} else {
-				// Следующий переход завтра утром
-				candidateTime := today.Add(hoursPerDay*time.Hour + time.Duration(startMinutes)*time.Minute)
-				if nextTransition == nil || candidateTime.Before(*nextTransition) {
-					nextTransition = &candidateTime
+		// Обработка расписания, которое переходит через полночь
+		if startMinutes > endMinutes {
+			if currentMinutes < endMinutes {
+				// Мы находимся в активном периоде (после полуночи)
+				candidateTime := today.Add(time.Duration(endMinutes) * time.Minute)
+				if nextTransition.IsZero() || candidateTime.Before(nextTransition) {
+					nextTransition = candidateTime
 				}
-				continue
+			} else if currentMinutes < startMinutes {
+				// Мы находимся между окончанием и началом
+				candidateTime := today.Add(time.Duration(startMinutes) * time.Minute)
+				if nextTransition.IsZero() || candidateTime.Before(nextTransition) {
+					nextTransition = candidateTime
+				}
+			} else {
+				// currentMinutes >= startMinutes - активный период, следующее событие - окончание завтра
+				candidateTime := today.Add(24*time.Hour).Add(time.Duration(endMinutes) * time.Minute)
+				if nextTransition.IsZero() || candidateTime.Before(nextTransition) {
+					nextTransition = candidateTime
+				}
 			}
 		} else {
-			// Расписание через полночь
-			if currentMinutes < endMinutes {
-				nextTransitionMinutes = endMinutes
-			} else if currentMinutes < startMinutes {
-				nextTransitionMinutes = startMinutes
-			} else {
-				// Следующий переход завтра
-				candidateTime := today.Add(hoursPerDay*time.Hour + time.Duration(endMinutes)*time.Minute)
-				if nextTransition == nil || candidateTime.Before(*nextTransition) {
-					nextTransition = &candidateTime
+			// Обычное расписание (не через полночь)
+			if currentMinutes < startMinutes {
+				// До начала - ждём начала сегодня
+				candidateTime := today.Add(time.Duration(startMinutes) * time.Minute)
+				if nextTransition.IsZero() || candidateTime.Before(nextTransition) {
+					nextTransition = candidateTime
 				}
-				continue
+			} else if currentMinutes < endMinutes {
+				// Внутри периода - ждём окончания сегодня
+				candidateTime := today.Add(time.Duration(endMinutes) * time.Minute)
+				if nextTransition.IsZero() || candidateTime.Before(nextTransition) {
+					nextTransition = candidateTime
+				}
+			} else {
+				// После окончания - ждём начала завтра
+				candidateTime := today.Add(24*time.Hour).Add(time.Duration(startMinutes) * time.Minute)
+				if nextTransition.IsZero() || candidateTime.Before(nextTransition) {
+					nextTransition = candidateTime
+				}
 			}
 		}
-
-		candidateTime := today.Add(time.Duration(nextTransitionMinutes) * time.Minute)
-		if nextTransition == nil || candidateTime.Before(*nextTransition) {
-			nextTransition = &candidateTime
-		}
 	}
 
-	if nextTransition != nil {
-		return *nextTransition
+	if !nextTransition.IsZero() {
+		return nextTransition
 	}
 
-	// Если расписаний нет, возвращаем дефолтный интервал
+	// Если нет активных расписаний, возвращаем дефолтный интервал
 	return now.Add(scheduleDefaultInterval)
 }
 
@@ -1114,10 +1127,9 @@ func (om *OpenWrtManager) checkAndApplySchedules() {
 		return
 	}
 
-	// Получаем состояния один раз для всех групп
 	groupStates, _, err := om.getGroupStates()
 	if err != nil {
-		log.Printf("Ошибка получения состояния групп: %v", err)
+		log.Printf("Ошибка получения состояний групп: %v", err)
 		return
 	}
 
@@ -1128,22 +1140,39 @@ func (om *OpenWrtManager) checkAndApplySchedules() {
 	}
 	settings.mu.RUnlock()
 
-	for groupName, groupConfig := range groups {
-		if len(groupConfig.Schedules) > 0 {
-			shouldBeActive := isFilterActiveBySchedules(groupConfig.Schedules)
-			currentlyActive := groupStates[groupName]
+	now := time.Now()
+	log.Printf("Проверка расписаний в %s", now.Format("15:04:05"))
 
-			if shouldBeActive != currentlyActive {
-				err := om.setGroupTag(groupName, shouldBeActive)
-				if err != nil {
-					log.Printf("Ошибка автоматического управления группой %s: %v", groupName, err)
-				} else {
-					status := "включена (вне времени отключения)"
-					if !shouldBeActive {
-						status = "отключена (время отключения)"
-					}
-					addLog(fmt.Sprintf("Группа %s автоматически %s по расписанию", groupName, status), "info")
+	for groupName, groupConfig := range groups {
+		// Проверяем наличие активных расписаний
+		hasEnabledSchedule := false
+		for _, schedule := range groupConfig.Schedules {
+			if schedule.Enabled {
+				hasEnabledSchedule = true
+				break
+			}
+		}
+
+		if !hasEnabledSchedule {
+			continue
+		}
+
+		shouldBeActive := isFilterActiveBySchedules(groupConfig.Schedules)
+		currentlyActive := groupStates[groupName]
+
+		log.Printf("Группа '%s': должна быть=%v, текущее состояние=%v",
+			groupName, shouldBeActive, currentlyActive)
+
+		if shouldBeActive != currentlyActive {
+			err := om.setGroupTag(groupName, shouldBeActive)
+			if err != nil {
+				log.Printf("Ошибка переключения группы '%s': %v", groupName, err)
+			} else {
+				status := "включён"
+				if !shouldBeActive {
+					status = "выключен"
 				}
+				addLog(fmt.Sprintf("Фильтр группы '%s' %s по расписанию", groupName, status), "info")
 			}
 		}
 	}
@@ -1156,28 +1185,47 @@ func (om *OpenWrtManager) getNextScheduleTime() time.Duration {
 	}
 
 	now := time.Now()
-	var nextEventTime *time.Time
+	var nextEventTime time.Time
 
 	settings.mu.RLock()
 	for _, groupConfig := range settings.Groups {
-		if len(groupConfig.Schedules) > 0 {
-			nextTime := getNextScheduleTransition(groupConfig.Schedules, now)
-			if nextEventTime == nil || nextTime.Before(*nextEventTime) {
-				nextEventTime = &nextTime
+		// Проверяем, есть ли активные расписания в группе
+		hasEnabledSchedule := false
+		for _, schedule := range groupConfig.Schedules {
+			if schedule.Enabled {
+				hasEnabledSchedule = true
+				break
 			}
+		}
+
+		if !hasEnabledSchedule {
+			continue
+		}
+
+		// Получаем время следующего перехода для этой группы
+		nextTime := getNextScheduleTransition(groupConfig.Schedules, now)
+
+		// Выбираем самое раннее время среди всех групп
+		if nextEventTime.IsZero() || nextTime.Before(nextEventTime) {
+			nextEventTime = nextTime
 		}
 	}
 	settings.mu.RUnlock()
 
-	if nextEventTime != nil {
-		duration := time.Until(*nextEventTime)
+	// Если есть запланированное событие
+	if !nextEventTime.IsZero() {
+		duration := time.Until(nextEventTime)
+
+		// Минимальная проверка - 1 секунда
 		if duration < scheduleMinCheckInterval {
 			duration = scheduleMinCheckInterval
 		}
-		log.Printf("Следующая проверка расписания через %v", duration)
+
+		log.Printf("Следующая проверка расписания через: %v (в %s)", duration, nextEventTime.Format("15:04:05"))
 		return duration
 	}
 
+	// Если нет активных расписаний, проверяем раз в минуту по умолчанию
 	return scheduleDefaultInterval
 }
 
@@ -1982,17 +2030,19 @@ func toggleHandler(w http.ResponseWriter, r *http.Request) {
 				if saveErr := saveSettings(); saveErr != nil {
 					log.Printf("Warning: Failed to save schedule state: %v", saveErr)
 				}
-				addLog(fmt.Sprintf("Расписания группы %s отключены (переход на ручное управление)", group), "info")
+				// Триггерим пересчёт времени следующей проверки
+				triggerScheduleCheck()
 			}
+			addLog(fmt.Sprintf("Фильтр группы '%s' переключён вручную, расписания отключены", group), "info")
 		} else {
 			settings.mu.Unlock()
 		}
 
-		status := "выключена"
+		status := "включён"
 		if newState {
-			status = "включена"
+			status = "выключен"
 		}
-		response := Response{Desc: fmt.Sprintf("Группа %s %s", group, status), Level: "success"}
+		response := Response{Desc: fmt.Sprintf("Фильтр группы '%s' %s", group, status), Level: "success"}
 		json.NewEncoder(w).Encode(response)
 	}
 }
