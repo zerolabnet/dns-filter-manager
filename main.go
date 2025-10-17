@@ -72,8 +72,7 @@ const (
 	bruteForceDelay        = 1 * time.Second
 	disconnectedCheckInterval = 10 * time.Second
 	scheduleMinCheckInterval  = 1 * time.Second
-	scheduleDefaultInterval   = 1 * time.Minute
-	scheduleNoConnectionInterval = 30 * time.Second
+	scheduleDefaultInterval   = 24 * time.Hour
 	serverReadTimeout      = 15 * time.Second
 	serverWriteTimeout     = 15 * time.Second
 	serverIdleTimeout      = 60 * time.Second
@@ -1108,6 +1107,7 @@ func getNextScheduleTransition(schedules []Schedule, now time.Time) time.Time {
 	}
 
 	// Если нет активных расписаний, возвращаем дефолтный интервал
+	log.Println("ПРЕДУПРЕЖДЕНИЕ: getNextScheduleTransition не нашла переход")
 	return now.Add(scheduleDefaultInterval)
 }
 
@@ -1179,14 +1179,17 @@ func (om *OpenWrtManager) checkAndApplySchedules() {
 }
 
 // Вычисление времени до следующего события расписания
-func (om *OpenWrtManager) getNextScheduleTime() time.Duration {
+func (om *OpenWrtManager) getNextScheduleTime() (time.Duration, bool) {
+	// Если не подключены к OpenWrt, проверяем реже
 	if !om.connected {
-		return disconnectedCheckInterval
+		return disconnectedCheckInterval, true
 	}
 
 	now := time.Now()
 	var nextEventTime time.Time
+	hasAnySchedules := false
 
+	// Проходим по всем группам и ищем ближайшее событие расписания
 	settings.mu.RLock()
 	for _, groupConfig := range settings.Groups {
 		// Проверяем, есть ли активные расписания в группе
@@ -1194,10 +1197,12 @@ func (om *OpenWrtManager) getNextScheduleTime() time.Duration {
 		for _, schedule := range groupConfig.Schedules {
 			if schedule.Enabled {
 				hasEnabledSchedule = true
+				hasAnySchedules = true
 				break
 			}
 		}
 
+		// Если в группе нет активных расписаний, пропускаем её
 		if !hasEnabledSchedule {
 			continue
 		}
@@ -1216,17 +1221,23 @@ func (om *OpenWrtManager) getNextScheduleTime() time.Duration {
 	if !nextEventTime.IsZero() {
 		duration := time.Until(nextEventTime)
 
-		// Минимальная проверка - 1 секунда
+		// Минимальная проверка - 1 секунда (защита от слишком частых проверок)
 		if duration < scheduleMinCheckInterval {
 			duration = scheduleMinCheckInterval
 		}
 
 		log.Printf("Следующая проверка расписания через: %v (в %s)", duration, nextEventTime.Format("15:04:05"))
-		return duration
+		return duration, true
 	}
 
-	// Если нет активных расписаний, проверяем раз в минуту по умолчанию
-	return scheduleDefaultInterval
+	// Если нет активных расписаний вообще
+	if !hasAnySchedules {
+		log.Println("Нет активных расписаний, ожидание триггера")
+		return 0, false
+	}
+
+	log.Println("ПРЕДУПРЕЖДЕНИЕ: Неожиданная ситуация в getNextScheduleTime")
+	return scheduleDefaultInterval, true
 }
 
 /* ==================== OPENWRT OPERATIONS ==================== */
@@ -2601,9 +2612,9 @@ func main() {
 				manager.checkAndApplySchedules()
 
 				// Затем вычисляем когда следующая проверка
-				nextCheck := manager.getNextScheduleTime()
+				nextCheck, useTimer := manager.getNextScheduleTime()
 
-				if nextCheck > 0 {
+				if useTimer {
 					select {
 					case <-time.After(nextCheck):
 						// Время пришло, продолжаем цикл
@@ -2613,9 +2624,10 @@ func main() {
 						log.Println("Немедленная проверка расписания по триггеру")
 					}
 				} else {
+					// Нет активных расписаний - ждём только триггера
 					select {
-					case <-time.After(scheduleNoConnectionInterval):
 					case <-scheduleCheckTrigger:
+						// Немедленная проверка по триггеру
 						log.Println("Немедленная проверка расписания по триггеру")
 					}
 				}
