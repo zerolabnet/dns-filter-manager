@@ -1160,8 +1160,7 @@ func (om *OpenWrtManager) checkAndApplySchedules() {
 		shouldBeActive := isFilterActiveBySchedules(groupConfig.Schedules)
 		currentlyActive := groupStates[groupName]
 
-		log.Printf("Группа '%s': должна быть=%v, текущее состояние=%v",
-			groupName, shouldBeActive, currentlyActive)
+		//log.Printf("Группа '%s': должна быть=%v, текущее состояние=%v", groupName, shouldBeActive, currentlyActive)
 
 		if shouldBeActive != currentlyActive {
 			err := om.setGroupTag(groupName, shouldBeActive)
@@ -1878,7 +1877,7 @@ func leasetimeSaveHandler(w http.ResponseWriter, r *http.Request) {
 		// Применяем изменения в OpenWrt если подключены
 		if manager.connected {
 			if err := manager.applyLeasetime(groupName, groupConfig); err != nil {
-				log.Printf("Warning: Failed to apply leasetime: %v", err)
+				log.Printf("Предупреждение: Не удалось применить leasetime: %v", err)
 			}
 		}
 		response := Response{Desc: "Настройки срока аренды сохранены", Level: "success"}
@@ -2318,8 +2317,23 @@ func updateGroupHandler(w http.ResponseWriter, r *http.Request) {
 			log.Printf("Ошибка удаления тегов со старых устройств: %v", err)
 		}
 
-		if err := manager.setTagsOnNewDevices(groupName, oldGroupConfig.Devices, devices, tag); err != nil {
-			log.Printf("Ошибка установки тегов на новые устройства: %v", err)
+		// Проверяем текущее состояние группы перед назначением тега новым устройствам
+		groupStates, _, _ := manager.getGroupStates()
+		isGroupActive := groupStates[groupName]
+
+		// Назначаем тег только если группа активна (фильтр включён)
+		if isGroupActive {
+			if err := manager.setTagsOnNewDevices(groupName, oldGroupConfig.Devices, devices, tag); err != nil {
+				log.Printf("Ошибка установки тегов на новые устройства: %v", err)
+			}
+		}
+
+		// Применяем DHCP lease для всех устройств группы (включая новые)
+		if err := manager.applyLeasetime(groupName, GroupConfig{
+			Devices:   devices,
+			Leasetime: oldGroupConfig.Leasetime,
+		}); err != nil {
+			log.Printf("Ошибка применения DHCP lease на устройства: %v", err)
 		}
 	}
 
