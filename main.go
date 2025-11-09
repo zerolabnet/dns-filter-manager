@@ -3867,44 +3867,21 @@ const htmlTemplate = `
 			background-color: #b71c1c;
 		}
 
-		/* Тултип при наведении */
-		.device-block-checkbox::before {
-			content: 'Блокировать доступ в Интернет для этого устройства';
-			position: absolute;
-			bottom: 100%;
-			left: 50%;
-			transform: translateX(-50%);
+		/* Динамический тултип */
+		.dynamic-tooltip {
+			position: fixed;
 			background-color: rgba(0, 0, 0, 0.85);
 			color: white;
 			padding: 6px 10px;
 			border-radius: 4px;
 			font-size: 12px;
-			white-space: nowrap;
-			opacity: 0;
+			/* УБРАНО: white-space: normal; */
+			/* УБРАНО: max-width: 220px; */
+			z-index: 9999;
 			pointer-events: none;
-			transition: opacity 0.2s ease;
-			margin-bottom: 6px;
-			z-index: 1000;
-		}
-
-		.device-block-checkbox::after {
-			content: '';
-			position: absolute;
-			bottom: 100%;
-			left: 50%;
-			transform: translateX(-50%);
-			border: 5px solid transparent;
-			border-top-color: rgba(0, 0, 0, 0.85);
 			opacity: 0;
-			pointer-events: none;
 			transition: opacity 0.2s ease;
-			margin-bottom: 1px;
-			z-index: 1000;
-		}
-
-		.device-block-checkbox:hover::before,
-		.device-block-checkbox:hover::after {
-			opacity: 1;
+			display: none;
 		}
 
 		.device-selector {
@@ -5680,6 +5657,82 @@ const htmlTemplate = `
 
 			// Вызываем при загрузке страницы
 			updateScheduleCounts();
+
+			// Универсальный обработчик для тултипов
+			(function() {
+				var tooltip = document.createElement('div');
+				tooltip.className = 'dynamic-tooltip';
+				document.body.appendChild(tooltip);
+
+				var enterTimeout, leaveTimeout;
+				var currentCheckbox = null;
+
+				function showTooltip(event) {
+					var checkboxLabel = event.currentTarget;
+					currentCheckbox = checkboxLabel;
+
+					clearTimeout(leaveTimeout);
+
+					enterTimeout = setTimeout(function() {
+						if (currentCheckbox !== checkboxLabel) return; // Если курсор уже на другом чекбоксе
+
+						tooltip.textContent = 'Блокировать доступ в Интернет для этого устройства';
+
+						var rect = checkboxLabel.getBoundingClientRect();
+						var viewportWidth = window.innerWidth;
+						var viewportHeight = window.innerHeight;
+
+						tooltip.style.width = 'auto';
+						tooltip.style.whiteSpace = 'nowrap';
+						tooltip.style.display = 'block';
+
+						var tooltipWidth = tooltip.offsetWidth;
+						var tooltipHeight = tooltip.offsetHeight;
+
+						if (tooltipWidth > (viewportWidth - 20)) {
+							tooltip.style.whiteSpace = 'normal';
+							tooltip.style.width = (viewportWidth - 20) + 'px';
+							tooltipWidth = tooltip.offsetWidth;
+							tooltipHeight = tooltip.offsetHeight;
+						}
+
+						var top = rect.bottom + 8;
+						var left = rect.left;
+
+						if (top + tooltipHeight > viewportHeight) {
+							top = rect.top - tooltipHeight - 8;
+						}
+
+						if (left + tooltipWidth > viewportWidth) {
+							left = viewportWidth - tooltipWidth - 10;
+						}
+
+						tooltip.style.top = top + 'px';
+						tooltip.style.left = left + 'px';
+						tooltip.style.opacity = '1';
+					}, 200);
+				}
+
+				function hideTooltip() {
+					currentCheckbox = null;
+					clearTimeout(enterTimeout);
+
+					leaveTimeout = setTimeout(function() {
+						tooltip.style.opacity = '0';
+						setTimeout(function() { tooltip.style.display = 'none'; }, 200);
+					}, 100);
+				}
+
+				// Привязываем события ко всем чекбоксам
+				document.querySelectorAll('.device-block-checkbox').forEach(function(checkboxLabel) {
+					checkboxLabel.addEventListener('mouseenter', showTooltip);
+					checkboxLabel.addEventListener('mouseleave', hideTooltip);
+				});
+
+				// Добавляем обработчики на сам тултип
+				tooltip.addEventListener('mouseenter', function() { clearTimeout(leaveTimeout); });
+				tooltip.addEventListener('mouseleave', hideTooltip);
+			})();
 		});
 
 		(function() {
