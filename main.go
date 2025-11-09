@@ -135,6 +135,7 @@ type GroupConfig struct {
 	Schedules     []Schedule           `json:"schedules,omitempty"`
 	DisableAction *FilterDisableAction `json:"disable_action,omitempty"`
 	Leasetime     *int                 `json:"leasetime,omitempty"` // DHCP Lease Time в минутах, nil = по умолчанию
+	BlockedDevices []string             `json:"blockeddevices,omitempty"`
 }
 
 type Schedule struct {
@@ -687,6 +688,11 @@ func (om *OpenWrtManager) ensureConnection() error {
 		// Синхронизация DHCP Lease Time
 		if syncErr := om.syncLeasetimeFromOpenWrt(); syncErr != nil {
 			addLog(fmt.Sprintf("Warning: Failed to sync leasetime: %v", syncErr), "warning")
+		}
+
+		// Синхронизация блокировок устройств
+		if syncErr := om.syncDeviceBlocksFromSettings(); syncErr != nil {
+			addLog(fmt.Sprintf("Warning: Failed to sync device blocks: %v", syncErr), "warning")
 		}
 
 		return nil
@@ -1540,6 +1546,31 @@ func (om *OpenWrtManager) setGroupTag(groupName string, enabled bool) error {
 		if err := om.commitChanges(); err != nil {
 			return err
 		}
+
+		// Применяем/снимаем блокировки устройств в зависимости от состояния фильтра
+		for _, device := range groupConfig.BlockedDevices {
+			// Проверяем, что устройство действительно в этой группе
+			isInGroup := false
+			for _, groupDevice := range groupConfig.Devices {
+				if groupDevice == device {
+					isInGroup = true
+					break
+				}
+			}
+
+			if isInGroup {
+				if err := om.applyDeviceInternetBlock(groupName, device, enabled); err != nil {
+					log.Printf("Предупреждение: ошибка при %s блокировки для %s: %v",
+						map[bool]string{true: "применении", false: "снятии"}[enabled], device, err)
+				} else {
+					if enabled {
+						log.Printf("Применена блокировка Интернета для %s в группе %s", device, groupName)
+					} else {
+						log.Printf("Снята блокировка Интернета для %s в группе %s", device, groupName)
+					}
+				}
+			}
+		}
 	}
 
 	if len(errors) > 0 {
@@ -1665,6 +1696,260 @@ func (om *OpenWrtManager) commitChanges() error {
 	_, err = om.executeCommand("/etc/init.d/dnsmasq reload")
 	if err != nil {
 		return fmt.Errorf("ошибка перезапуска dnsmasq: %w", err)
+	}
+
+	return nil
+}
+
+// getFirewallZoneForIP определяет зону firewall для IP-адреса
+func (om *OpenWrtManager) getFirewallZoneForIP(ip string) (string, error) {
+	// Получаем список всех зон и их подсетей
+	output, err := om.executeCommand("uci show firewall | grep '=zone'")
+	if err != nil {
+		return "", fmt.Errorf("failed to get firewall zones: %w", err)
+	}
+
+	// Парсим зоны
+	zones := []string{}
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		// Извлекаем имя секции зоны: firewall.lan='zone' -> lan
+		parts := strings.Split(line, ".")
+		if len(parts) >= 2 {
+			zoneName := strings.Split(parts[1], "=")[0]
+			zones = append(zones, zoneName)
+		}
+	}
+
+	// Для каждой зоны проверяем, включает ли её подсеть наш IP
+	for _, zone := range zones {
+		// Получаем имя зоны
+		zoneNameCmd := fmt.Sprintf("uci get firewall.%s.name 2>/dev/null || echo '%s'", zone, zone)
+		zoneName, err := om.executeCommand(zoneNameCmd)
+		if err != nil {
+			continue
+		}
+		zoneName = strings.TrimSpace(zoneName)
+
+		// Получаем список сетей в этой зоне
+		networksCmd := fmt.Sprintf("uci get firewall.%s.network 2>/dev/null || echo ''", zone)
+		networksOutput, err := om.executeCommand(networksCmd)
+		if err != nil {
+			continue
+		}
+		networksOutput = strings.TrimSpace(networksOutput)
+
+		if networksOutput == "" {
+			continue
+		}
+
+		// Разбиваем список сетей (могут быть через пробел)
+		networks := strings.Fields(networksOutput)
+
+		// Для каждой сети проверяем, входит ли IP в её подсеть
+		for _, network := range networks {
+			// Получаем подсеть для этой сети
+			subnetCmd := fmt.Sprintf("uci get network.%s.ipaddr 2>/dev/null || echo ''", network)
+			subnetIP, err := om.executeCommand(subnetCmd)
+			if err != nil || strings.TrimSpace(subnetIP) == "" {
+				continue
+			}
+			subnetIP = strings.TrimSpace(subnetIP)
+
+			netmaskCmd := fmt.Sprintf("uci get network.%s.netmask 2>/dev/null || echo '255.255.255.0'", network)
+			netmask, err := om.executeCommand(netmaskCmd)
+			if err != nil {
+				continue
+			}
+			netmask = strings.TrimSpace(netmask)
+
+			// Проверяем, находится ли IP в этой подсети
+			if om.isIPInSubnet(ip, subnetIP, netmask) {
+				log.Printf("IP %s принадлежит зоне '%s' (сеть %s)", ip, zoneName, network)
+				return zoneName, nil
+			}
+		}
+	}
+
+	// Если зону не удалось определить, возвращаем 'lan' по умолчанию
+	log.Printf("Не удалось определить зону для IP %s, используем 'lan' по умолчанию", ip)
+	return "lan", nil
+}
+
+// isIPInSubnet проверяет, находится ли IP в подсети
+func (om *OpenWrtManager) isIPInSubnet(ip, subnetIP, netmask string) bool {
+	// Преобразуем IP и subnet в числа для сравнения
+	ipParts := strings.Split(ip, ".")
+	subnetParts := strings.Split(subnetIP, ".")
+	maskParts := strings.Split(netmask, ".")
+
+	if len(ipParts) != 4 || len(subnetParts) != 4 || len(maskParts) != 4 {
+		return false
+	}
+
+	for i := 0; i < 4; i++ {
+		ipByte, _ := strconv.Atoi(ipParts[i])
+		subnetByte, _ := strconv.Atoi(subnetParts[i])
+		maskByte, _ := strconv.Atoi(maskParts[i])
+
+		// Применяем маску и сравниваем
+		if (ipByte & maskByte) != (subnetByte & maskByte) {
+			return false
+		}
+	}
+
+	return true
+}
+
+// applyDeviceInternetBlock применяет или снимает блокировку Интернета для конкретного устройства
+func (om *OpenWrtManager) applyDeviceInternetBlock(groupName, hostName string, block bool) error {
+	// Получаем IP устройства
+	hostsInfo, err := om.getHostsInfo()
+	if err != nil {
+		return fmt.Errorf("не удалось получить информацию о хостах: %w", err)
+	}
+
+	var deviceIP string
+	for _, hostData := range hostsInfo {
+		if name, ok := hostData["name"]; ok && name == hostName {
+			if ip, ok := hostData["ip"]; ok {
+				deviceIP = ip
+				break
+			}
+		}
+	}
+
+	if deviceIP == "" {
+		return fmt.Errorf("не удалось найти IP для устройства %s", hostName)
+	}
+
+	// Определяем зону firewall для этого IP
+	zone, err := om.getFirewallZoneForIP(deviceIP)
+	if err != nil {
+		log.Printf("Ошибка определения зоны для %s: %v, используем 'lan'", deviceIP, err)
+		zone = "lan"
+	}
+
+	ruleName := "block_" + groupName + "_" + strings.ReplaceAll(deviceIP, ".", "_")
+
+	if block {
+		log.Printf("Блокируем Интернет для %s (%s) в группе %s (зона: %s)", hostName, deviceIP, groupName, zone)
+
+		// Сначала разрываем соединения
+		om.executeCommand(fmt.Sprintf("conntrack -D -s %s 2>/dev/null || true", deviceIP))
+		log.Printf("Соединения для %s разорваны", deviceIP)
+
+		// Создаем правило блокировки
+		log.Printf("Создание правила firewall: %s", ruleName)
+
+		_, err = om.executeCommand(fmt.Sprintf("uci set firewall.%s='rule'", ruleName))
+		if err != nil {
+			log.Printf("ERROR: uci set rule: %v", err)
+			return fmt.Errorf("uci set rule: %v", err)
+		}
+
+		_, err = om.executeCommand(fmt.Sprintf("uci set firewall.%s.name='Block %s - %s'", ruleName, groupName, hostName))
+		if err != nil {
+			log.Printf("ERROR: uci set name: %v", err)
+			return fmt.Errorf("uci set name: %v", err)
+		}
+
+		// Используем определенную зону вместо хардкода 'lan'
+		_, err = om.executeCommand(fmt.Sprintf("uci set firewall.%s.src='%s'", ruleName, zone))
+		if err != nil {
+			log.Printf("ERROR: uci set src: %v", err)
+			return fmt.Errorf("uci set src: %v", err)
+		}
+
+		_, err = om.executeCommand(fmt.Sprintf("uci set firewall.%s.src_ip='%s'", ruleName, deviceIP))
+		if err != nil {
+			log.Printf("ERROR: uci set src_ip: %v", err)
+			return fmt.Errorf("uci set src_ip: %v", err)
+		}
+
+		_, err = om.executeCommand(fmt.Sprintf("uci set firewall.%s.target='DROP'", ruleName))
+		if err != nil {
+			log.Printf("ERROR: uci set target: %v", err)
+			return fmt.Errorf("uci set target: %v", err)
+		}
+
+		// Применяем изменения
+		log.Printf("Применяем изменения (uci commit firewall)")
+		_, err = om.executeCommand("uci commit firewall")
+		if err != nil {
+			log.Printf("ERROR: uci commit: %v", err)
+			return fmt.Errorf("uci commit firewall: %v", err)
+		}
+
+		log.Printf("Перезагружаем firewall")
+		_, err = om.executeCommand("/etc/init.d/firewall reload")
+		if err != nil {
+			log.Printf("ERROR: firewall reload: %v", err)
+			return fmt.Errorf("firewall reload: %v", err)
+		}
+
+		log.Printf("Блокировка для %s (%s) успешно применена", hostName, deviceIP)
+	} else {
+		log.Printf("Снимаем блокировку с %s (%s) в группе %s", hostName, deviceIP, groupName)
+
+		_, err = om.executeCommand(fmt.Sprintf("uci delete firewall.%s 2>/dev/null || true", ruleName))
+		if err != nil {
+			log.Printf("ERROR: uci delete: %v", err)
+			return fmt.Errorf("uci delete: %v", err)
+		}
+
+		_, err = om.executeCommand("uci commit firewall")
+		if err != nil {
+			log.Printf("ERROR: uci commit: %v", err)
+			return fmt.Errorf("uci commit firewall: %v", err)
+		}
+
+		_, err = om.executeCommand("/etc/init.d/firewall reload")
+		if err != nil {
+			log.Printf("ERROR: firewall reload: %v", err)
+			return fmt.Errorf("firewall reload: %v", err)
+		}
+
+		log.Printf("Блокировка для %s (%s) успешно снята", hostName, deviceIP)
+	}
+
+	return nil
+}
+
+// syncDeviceBlocksFromSettings применяет блокировки из настроек при подключении к OpenWrt
+func (om *OpenWrtManager) syncDeviceBlocksFromSettings() error {
+	// Получаем текущее состояние фильтров на OpenWrt
+	groupStates, _, err := om.getGroupStates()
+	if err != nil {
+		return fmt.Errorf("failed to get group states: %w", err)
+	}
+
+	settings.mu.RLock()
+	defer settings.mu.RUnlock()
+
+	for groupName, groupConfig := range settings.Groups {
+		// Применяем блокировки только если фильтр включен
+		if filterEnabled, ok := groupStates[groupName]; ok && filterEnabled {
+			for _, device := range groupConfig.BlockedDevices {
+				// Проверяем, что устройство в группе
+				isInGroup := false
+				for _, groupDevice := range groupConfig.Devices {
+					if groupDevice == device {
+						isInGroup = true
+						break
+					}
+				}
+
+				if isInGroup {
+					if err := om.applyDeviceInternetBlock(groupName, device, true); err != nil {
+						log.Printf("Warning: Failed to apply block for %s in group %s: %v", device, groupName, err)
+					}
+				}
+			}
+		}
 	}
 
 	return nil
@@ -1883,6 +2168,108 @@ func leasetimeSaveHandler(w http.ResponseWriter, r *http.Request) {
 		response := Response{Desc: "Настройки срока аренды сохранены", Level: "success"}
 		json.NewEncoder(w).Encode(response)
 	}
+}
+
+// blockDeviceGetHandler возвращает список заблокированных устройств для группы
+func blockDeviceGetHandler(w http.ResponseWriter, r *http.Request) {
+	groupName := strings.TrimPrefix(r.URL.Path, "/api/block-device/")
+
+	settings.mu.RLock()
+	groupConfig, exists := settings.Groups[groupName]
+	settings.mu.RUnlock()
+
+	if exists {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"blockeddevices": groupConfig.BlockedDevices,
+		})
+	} else {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"blockeddevices": []string{},
+		})
+	}
+}
+
+// blockDeviceSaveHandler сохраняет настройку блокировки для устройства
+func blockDeviceSaveHandler(w http.ResponseWriter, r *http.Request) {
+	groupName := r.FormValue("groupname")
+	deviceName := r.FormValue("device")
+	blockStr := r.FormValue("block")
+	block := blockStr == "true"
+
+	settings.mu.Lock()
+	groupConfig, exists := settings.Groups[groupName]
+	if !exists {
+		settings.mu.Unlock()
+		response := Response{Desc: "Группа не найдена", Level: "error"}
+		json.NewEncoder(w).Encode(response)
+		return
+	}
+
+	// Обновляем список заблокированных устройств
+	if block {
+		// Добавляем устройство в список заблокированных
+		found := false
+		for _, dev := range groupConfig.BlockedDevices {
+			if dev == deviceName {
+				found = true
+				break
+			}
+		}
+		if !found {
+			groupConfig.BlockedDevices = append(groupConfig.BlockedDevices, deviceName)
+		}
+	} else {
+		// Удаляем устройство из списка заблокированных
+		newBlocked := []string{}
+		for _, dev := range groupConfig.BlockedDevices {
+			if dev != deviceName {
+				newBlocked = append(newBlocked, dev)
+			}
+		}
+		groupConfig.BlockedDevices = newBlocked
+	}
+
+	settings.Groups[groupName] = groupConfig
+	settings.mu.Unlock()
+
+	if err := saveSettings(); err != nil {
+		response := Response{Desc: fmt.Sprintf("Ошибка сохранения: %v", err), Level: "error"}
+		json.NewEncoder(w).Encode(response)
+		return
+	}
+
+	// Проверяем, включен ли сейчас фильтр для группы (через OpenWrt)
+	filterEnabled := false
+	if manager.connected {
+		groupStates, _, err := manager.getGroupStates()
+		if err == nil {
+			filterEnabled = groupStates[groupName]
+		}
+	}
+
+	// Применяем блокировку только если фильтр сейчас включен
+	if manager.connected && filterEnabled {
+		if err := manager.applyDeviceInternetBlock(groupName, deviceName, block); err != nil {
+			log.Printf("Ошибка применения блокировки: %v", err)
+			response := Response{Desc: fmt.Sprintf("Настройка сохранена, но ошибка применения: %v", err), Level: "warning"}
+			json.NewEncoder(w).Encode(response)
+			return
+		}
+	}
+
+	status := "будет блокироваться при включении фильтра"
+	if !block {
+		status = "не будет блокироваться"
+	}
+	if filterEnabled && manager.connected {
+		status = "заблокировано"
+		if !block {
+			status = "разблокировано"
+		}
+	}
+
+	response := Response{Desc: fmt.Sprintf("Устройство %s", status), Level: "success"}
+	json.NewEncoder(w).Encode(response)
 }
 
 func adguardSettingsHandler(w http.ResponseWriter, r *http.Request) {
@@ -2674,6 +3061,8 @@ func main() {
 	mux.HandleFunc("/api/disable-action-save", apiPostMiddleware(disableActionSaveHandler))
 	mux.HandleFunc("/api/leasetime/", apiMiddleware(leasetimeGetHandler))
 	mux.HandleFunc("/api/leasetime-save", apiPostMiddleware(leasetimeSaveHandler))
+	mux.HandleFunc("/api/block-device/", apiMiddleware(blockDeviceGetHandler))
+	mux.HandleFunc("/api/block-device-save", apiPostMiddleware(blockDeviceSaveHandler))
 	mux.HandleFunc("/api/adguard-settings", apiPostMiddleware(adguardSettingsHandler))
 	mux.HandleFunc("/api/adguard-test", apiMiddleware(adguardTestHandler))
 	mux.HandleFunc("/api/toggle", apiPostMiddleware(toggleHandler))
@@ -3423,6 +3812,101 @@ const htmlTemplate = `
 			background: #dc2626;
 		}
 
+		/* Кастомный чекбокс для блокировки устройства */
+		.device-block-checkbox {
+			display: inline-flex;
+			align-items: center;
+			cursor: pointer;
+			padding: 0;
+			vertical-align: middle;
+			position: relative;
+		}
+
+		/* Скрываем стандартный чекбокс */
+		.device-block-checkbox input[type="checkbox"] {
+			position: absolute;
+			opacity: 0;
+			cursor: pointer;
+			width: 0;
+			height: 0;
+		}
+
+		/* Индикатор блокировки - кружок */
+		.device-block-checkbox .block-indicator {
+			display: inline-block;
+			width: 18px;
+			height: 18px;
+			border: 2px solid #d32f2f;
+			border-radius: 50%;
+			position: relative;
+			transition: all 0.2s ease;
+			background-color: #fff;
+		}
+
+		/* Горизонтальная черта (появляется при checked) */
+		.device-block-checkbox input[type="checkbox"]:checked + .block-indicator::after {
+			content: '';
+			position: absolute;
+			left: 50%;
+			top: 50%;
+			width: 10px;
+			height: 2px;
+			background-color: #d32f2f;
+			transform: translate(-50%, -50%);
+			transition: all 0.2s ease;
+		}
+
+		/* Эффект при наведении */
+		.device-block-checkbox:hover .block-indicator {
+			border-color: #b71c1c;
+			background-color: #ffebee;
+			box-shadow: 0 0 4px rgba(211, 47, 47, 0.3);
+		}
+
+		.device-block-checkbox:hover input[type="checkbox"]:checked + .block-indicator::after {
+			background-color: #b71c1c;
+		}
+
+		/* Тултип при наведении */
+		.device-block-checkbox::before {
+			content: 'Блокировать доступ в Интернет для этого устройства';
+			position: absolute;
+			bottom: 100%;
+			left: 50%;
+			transform: translateX(-50%);
+			background-color: rgba(0, 0, 0, 0.85);
+			color: white;
+			padding: 6px 10px;
+			border-radius: 4px;
+			font-size: 12px;
+			white-space: nowrap;
+			opacity: 0;
+			pointer-events: none;
+			transition: opacity 0.2s ease;
+			margin-bottom: 6px;
+			z-index: 1000;
+		}
+
+		.device-block-checkbox::after {
+			content: '';
+			position: absolute;
+			bottom: 100%;
+			left: 50%;
+			transform: translateX(-50%);
+			border: 5px solid transparent;
+			border-top-color: rgba(0, 0, 0, 0.85);
+			opacity: 0;
+			pointer-events: none;
+			transition: opacity 0.2s ease;
+			margin-bottom: 1px;
+			z-index: 1000;
+		}
+
+		.device-block-checkbox:hover::before,
+		.device-block-checkbox:hover::after {
+			opacity: 1;
+		}
+
 		.device-selector {
 			border: 1px solid var(--border-color);
 			border-radius: 8px;
@@ -3903,6 +4387,22 @@ const htmlTemplate = `
 							<button class="btn-remove-device" onclick="removeDevice('{{$device}}')" title="Удалить устройство из всех групп">✕</button>
 						{{else}}<span class="status-active">{{$status}}</span>{{end}}
 						</span>
+
+						{{/* Чекбокс блокировки Интернета */}}
+						{{$isBlocked := false}}
+						{{range $config.BlockedDevices}}
+							{{if eq . $device}}
+								{{$isBlocked = true}}
+							{{end}}
+						{{end}}
+						<label class="device-block-checkbox">
+							<input type="checkbox"
+								   data-group="{{$group}}"
+								   data-device="{{$device}}"
+								   {{if $isBlocked}}checked{{end}}
+								   onchange="toggleDeviceBlock(this, '{{$group}}', '{{$device}}')">
+							<span class="block-indicator"></span>
+						</label>
 						{{end}}
 					</div>
 
@@ -4792,6 +5292,34 @@ const htmlTemplate = `
 					console.error('Error saving leasetime:', error);
 					showStatus('Ошибка сохранения настроек', 'error');
 				});
+		}
+
+		function toggleDeviceBlock(checkbox, groupName, deviceName) {
+			var isBlocked = checkbox.checked;
+
+			var formData = new FormData();
+			formData.append('groupname', groupName);
+			formData.append('device', deviceName);
+			formData.append('block', isBlocked ? 'true' : 'false');
+
+			fetch('/api/block-device-save', {
+				method: 'POST',
+				body: formData
+			})
+			.then(function(response) { return response.json(); })
+			.then(function(data) {
+				if (data.level === 'success') {
+					showStatus(data.desc, 'success');
+				} else {
+					showStatus(data.desc, 'error');
+					checkbox.checked = !isBlocked; // Возвращаем состояние при ошибке
+				}
+			})
+			.catch(function(error) {
+				console.error('Error toggling device block:', error);
+				showStatus('Ошибка изменения блокировки', 'error');
+				checkbox.checked = !isBlocked; // Возвращаем состояние при ошибке
+			});
 		}
 
 		function saveAdGuardSettings() {
