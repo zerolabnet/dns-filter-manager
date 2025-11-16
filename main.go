@@ -5,7 +5,9 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
+	"crypto/md5"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"html/template"
@@ -33,9 +35,11 @@ import (
 // Регулярные выражения для валидации имен
 var (
 	// Безопасные имена: буквы, цифры, дефис, подчеркивание
-	safeNameRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
+	safeNameRegex       = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 	// Безопасные имена устройств (могут содержать точки для доменов)
 	safeDeviceNameRegex = regexp.MustCompile(`^[a-zA-Z0-9._-]+$`)
+	// Безопасные имена для UCI
+	safeUCIRegex        = regexp.MustCompile(`^[a-z0-9_]+$`)
 )
 
 // isValidName проверяет безопасность имени для UCI команд
@@ -46,6 +50,22 @@ func isValidName(name string) bool {
 // isValidDeviceName проверяет безопасность имени устройства
 func isValidDeviceName(name string) bool {
 	return len(name) > 0 && len(name) < 253 && safeDeviceNameRegex.MatchString(name)
+}
+
+// sanitizeForUCI преобразует имя в безопасный идентификатор для UCI
+// UCI поддерживает только строчные буквы, цифры и подчёркивание
+func sanitizeForUCI(name string) string {
+	// Приводим к нижнему регистру и проверяем допустимость
+	lower := strings.ToLower(name)
+
+	// Если строка содержит только разрешенные символы, используем её
+	if len(lower) > 0 && len(lower) <= 32 && safeUCIRegex.MatchString(lower) {
+		return lower
+	}
+
+	// Для нелатинских имён создаём короткий хеш с префиксом
+	hash := md5.Sum([]byte(name))
+	return "g_" + hex.EncodeToString(hash[:])[:12]
 }
 
 /* ==================== КОНСТАНТЫ ==================== */
@@ -1173,6 +1193,11 @@ func (om *OpenWrtManager) checkAndApplySchedules() {
 			if err != nil {
 				log.Printf("Ошибка переключения группы '%s': %v", groupName, err)
 			} else {
+				// Синхронизируем firewall-блокировки
+				if syncErr := om.syncGroupDeviceBlocks(groupName, shouldBeActive); syncErr != nil {
+					log.Printf("Предупреждение: ошибка синхронизации блокировок для '%s': %v", groupName, syncErr)
+				}
+
 				status := "включён"
 				if !shouldBeActive {
 					status = "выключен"
@@ -1546,31 +1571,6 @@ func (om *OpenWrtManager) setGroupTag(groupName string, enabled bool) error {
 		if err := om.commitChanges(); err != nil {
 			return err
 		}
-
-		// Применяем/снимаем блокировки устройств в зависимости от состояния фильтра
-		for _, device := range groupConfig.BlockedDevices {
-			// Проверяем, что устройство действительно в этой группе
-			isInGroup := false
-			for _, groupDevice := range groupConfig.Devices {
-				if groupDevice == device {
-					isInGroup = true
-					break
-				}
-			}
-
-			if isInGroup {
-				if err := om.applyDeviceInternetBlock(groupName, device, enabled); err != nil {
-					log.Printf("Предупреждение: ошибка при %s блокировки для %s: %v",
-						map[bool]string{true: "применении", false: "снятии"}[enabled], device, err)
-				} else {
-					if enabled {
-						log.Printf("Применена блокировка Интернета для %s в группе %s", device, groupName)
-					} else {
-						log.Printf("Снята блокировка Интернета для %s в группе %s", device, groupName)
-					}
-				}
-			}
-		}
 	}
 
 	if len(errors) > 0 {
@@ -1578,6 +1578,45 @@ func (om *OpenWrtManager) setGroupTag(groupName string, enabled bool) error {
 			return fmt.Errorf("частичный успех (%d/%d): %s", successCount, len(groupConfig.Devices), strings.Join(errors, "; "))
 		}
 		return fmt.Errorf("ошибки: %s", strings.Join(errors, "; "))
+	}
+
+	return nil
+}
+
+// syncGroupDeviceBlocks синхронизирует состояние блокировок устройств с состоянием фильтров группы
+func (om *OpenWrtManager) syncGroupDeviceBlocks(groupName string, filterEnabled bool) error {
+	settings.mu.RLock()
+	groupConfig, exists := settings.Groups[groupName]
+	settings.mu.RUnlock()
+
+	if !exists {
+		return fmt.Errorf("группа не найдена")
+	}
+
+	var errors []string
+
+	for _, device := range groupConfig.BlockedDevices {
+		// Проверяем, входит ли устройство в группу
+		isInGroup := false
+		for _, groupDevice := range groupConfig.Devices {
+			if groupDevice == device {
+				isInGroup = true
+				break
+			}
+		}
+
+		// Применяем блокировку только если устройство в группе и фильтры включены
+		if isInGroup {
+			shouldBlock := filterEnabled
+			if err := om.applyDeviceInternetBlock(groupName, device, shouldBlock); err != nil {
+				log.Printf("Ошибка синхронизации блокировки для %s: %v", device, err)
+				errors = append(errors, fmt.Sprintf("%s: %v", device, err))
+			}
+		}
+	}
+
+	if len(errors) > 0 {
+		return fmt.Errorf("ошибки синхронизации блокировок: %s", strings.Join(errors, "; "))
 	}
 
 	return nil
@@ -1833,7 +1872,7 @@ func (om *OpenWrtManager) applyDeviceInternetBlock(groupName, hostName string, b
 		zone = "lan"
 	}
 
-	ruleName := "block_" + groupName + "_" + strings.ReplaceAll(deviceIP, ".", "_")
+	ruleName := "block_" + sanitizeForUCI(groupName) + "_" + strings.ReplaceAll(deviceIP, ".", "_")
 
 	if block {
 		log.Printf("Блокируем Интернет для %s (%s) в группе %s (зона: %s)", hostName, deviceIP, groupName, zone)
@@ -2409,6 +2448,11 @@ func toggleHandler(w http.ResponseWriter, r *http.Request) {
 		response := Response{Desc: fmt.Sprintf("Ошибка: %v", err), Level: "error"}
 		json.NewEncoder(w).Encode(response)
 	} else {
+		// Синхронизируем firewall-блокировки устройств
+		if syncErr := manager.syncGroupDeviceBlocks(group, newState); syncErr != nil {
+			log.Printf("Предупреждение: ошибка синхронизации блокировок для группы %s: %v", group, syncErr)
+		}
+
 		// Отключаем все расписания при ручном переключении
 		settings.mu.Lock()
 		groupConfig, exists := settings.Groups[group]
