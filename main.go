@@ -35,7 +35,7 @@ import (
 // Регулярные выражения для валидации имен
 var (
 	// Безопасные имена: буквы, цифры, дефис, подчеркивание
-	safeNameRegex       = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
+	safeNameRegex       = regexp.MustCompile(`^[\p{L}0-9_-]+$`)
 	// Безопасные имена устройств (могут содержать точки для доменов)
 	safeDeviceNameRegex = regexp.MustCompile(`^[a-zA-Z0-9._-]+$`)
 	// Безопасные имена для UCI
@@ -91,6 +91,7 @@ const (
 	httpClientTimeout      = 30 * time.Second
 	bruteForceDelay        = 1 * time.Second
 	disconnectedCheckInterval = 10 * time.Second
+	autoReconnectInterval     = 30 * time.Second
 	scheduleMinCheckInterval  = 1 * time.Second
 	scheduleDefaultInterval   = 24 * time.Hour
 	serverReadTimeout      = 15 * time.Second
@@ -165,6 +166,9 @@ type Schedule struct {
 	StartMin  int    `json:"start_min"`
 	EndHour   int    `json:"end_hour"`
 	EndMin    int    `json:"end_min"`
+	// Дни недели: 0=Вс, 1=Пн, 2=Вт, 3=Ср, 4=Чт, 5=Пт, 6=Сб (Go time.Weekday).
+	// Пустой слайс означает «каждый день».
+	Days      []int  `json:"days,omitempty"`
 }
 
 type FilterDisableAction struct {
@@ -771,7 +775,12 @@ func (om *OpenWrtManager) executeCommand(cmd string) (string, error) {
 
 	session, err := om.sshClient.NewSession()
 	if err != nil {
-		return "", err
+		// Соединение упало — помечаем как отключённое, чтобы авто-переподключение сработало
+		om.mu.Lock()
+		om.connected = false
+		om.sshClient = nil
+		om.mu.Unlock()
+		return "", fmt.Errorf("SSH сессия потеряна (соединение разорвано): %w", err)
 	}
 	defer session.Close()
 
@@ -993,7 +1002,42 @@ func saveFilterList(content string) error {
 /* ==================== SCHEDULE ==================== */
 
 // Проверка пересечения двух временных интервалов
+// dayMatches возвращает true, если weekday входит в список days.
+// Пустой список означает «все дни недели».
+// weekday — значение time.Weekday: 0=Вс, 1=Пн, ..., 6=Сб.
+func dayMatches(days []int, weekday int) bool {
+	if len(days) == 0 {
+		return true
+	}
+	for _, d := range days {
+		if d == weekday {
+			return true
+		}
+	}
+	return false
+}
+
 func schedulesOverlap(s1, s2 Schedule) bool {
+	// Если у обоих расписаний явно указаны дни — проверяем наличие общего дня.
+	// Расписания с непересекающимися днями не могут конфликтовать по времени.
+	if len(s1.Days) > 0 && len(s2.Days) > 0 {
+		hasCommonDay := false
+		for _, d1 := range s1.Days {
+			for _, d2 := range s2.Days {
+				if d1 == d2 {
+					hasCommonDay = true
+					break
+				}
+			}
+			if hasCommonDay {
+				break
+			}
+		}
+		if !hasCommonDay {
+			return false
+		}
+	}
+
 	start1 := s1.StartHour*minutesPerHour + s1.StartMin
 	end1 := s1.EndHour*minutesPerHour + s1.EndMin
 	start2 := s2.StartHour*minutesPerHour + s2.StartMin
@@ -1040,9 +1084,9 @@ func validateSchedules(schedules []Schedule) error {
 // Проверка активности для массива расписаний
 func isFilterActiveBySchedules(schedules []Schedule) bool {
 	now := time.Now()
-	currentHour := now.Hour()
-	currentMin := now.Minute()
-	currentMinutes := currentHour*minutesPerHour + currentMin
+	currentWeekday := int(now.Weekday())                  // 0=Вс, 1=Пн, ..., 6=Сб
+	yesterday := (currentWeekday + 6) % 7                 // предыдущий день
+	currentMinutes := now.Hour()*minutesPerHour + now.Minute()
 
 	for _, schedule := range schedules {
 		if !schedule.Enabled {
@@ -1052,19 +1096,23 @@ func isFilterActiveBySchedules(schedules []Schedule) bool {
 		startMinutes := schedule.StartHour*minutesPerHour + schedule.StartMin
 		endMinutes := schedule.EndHour*minutesPerHour + schedule.EndMin
 
-		// Проверка попадания в интервал
-		if startMinutes <= endMinutes {
-			if currentMinutes >= startMinutes && currentMinutes < endMinutes {
+		if startMinutes > endMinutes {
+			// Расписание через полночь: вечерняя часть — в день schedule.Days,
+			// утренняя часть — это «хвост» предыдущего дня.
+			inEvening := currentMinutes >= startMinutes && dayMatches(schedule.Days, currentWeekday)
+			inMorning := currentMinutes < endMinutes && dayMatches(schedule.Days, yesterday)
+			if inEvening || inMorning {
 				return false
 			}
 		} else {
-			if currentMinutes >= startMinutes || currentMinutes < endMinutes {
+			// Обычное расписание: оба конца в один день
+			if dayMatches(schedule.Days, currentWeekday) &&
+				currentMinutes >= startMinutes && currentMinutes < endMinutes {
 				return false
 			}
 		}
 	}
 
-	// Если нет включенных расписаний, возвращаем false (фильтр неактивен)
 	return true
 }
 
@@ -1072,59 +1120,50 @@ func isFilterActiveBySchedules(schedules []Schedule) bool {
 func getNextScheduleTransition(schedules []Schedule, now time.Time) time.Time {
 	var nextTransition time.Time
 
-	for _, schedule := range schedules {
-		if !schedule.Enabled {
-			continue
+	// Просматриваем ближайшие 8 дней, чтобы найти следующий переход
+	// даже если текущий день не входит ни в одно расписание.
+	for dayOffset := 0; dayOffset < 8; dayOffset++ {
+		checkDate := now.AddDate(0, 0, dayOffset)
+		checkWeekday := int(checkDate.Weekday())
+		yesterday := (checkWeekday + 6) % 7
+		dayStart := time.Date(checkDate.Year(), checkDate.Month(), checkDate.Day(), 0, 0, 0, 0, checkDate.Location())
+
+		for _, schedule := range schedules {
+			if !schedule.Enabled {
+				continue
+			}
+
+			startMinutes := schedule.StartHour*minutesPerHour + schedule.StartMin
+			endMinutes := schedule.EndHour*minutesPerHour + schedule.EndMin
+
+			addIfFuture := func(t time.Time) {
+				if t.After(now) {
+					if nextTransition.IsZero() || t.Before(nextTransition) {
+						nextTransition = t
+					}
+				}
+			}
+
+			if startMinutes > endMinutes {
+				// Вечерняя граница «включения»: начинается на checkWeekday
+				if dayMatches(schedule.Days, checkWeekday) {
+					addIfFuture(dayStart.Add(time.Duration(startMinutes) * time.Minute))
+				}
+				// Утренняя граница «выключения»: это конец расписания вчерашнего дня
+				if dayMatches(schedule.Days, yesterday) {
+					addIfFuture(dayStart.Add(time.Duration(endMinutes) * time.Minute))
+				}
+			} else {
+				if dayMatches(schedule.Days, checkWeekday) {
+					addIfFuture(dayStart.Add(time.Duration(startMinutes) * time.Minute))
+					addIfFuture(dayStart.Add(time.Duration(endMinutes) * time.Minute))
+				}
+			}
 		}
 
-		currentMinutes := now.Hour()*minutesPerHour + now.Minute()
-		startMinutes := schedule.StartHour*minutesPerHour + schedule.StartMin
-		endMinutes := schedule.EndHour*minutesPerHour + schedule.EndMin
-
-		today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
-
-		// Обработка расписания, которое переходит через полночь
-		if startMinutes > endMinutes {
-			if currentMinutes < endMinutes {
-				// Мы находимся в активном периоде (после полуночи)
-				candidateTime := today.Add(time.Duration(endMinutes) * time.Minute)
-				if nextTransition.IsZero() || candidateTime.Before(nextTransition) {
-					nextTransition = candidateTime
-				}
-			} else if currentMinutes < startMinutes {
-				// Мы находимся между окончанием и началом
-				candidateTime := today.Add(time.Duration(startMinutes) * time.Minute)
-				if nextTransition.IsZero() || candidateTime.Before(nextTransition) {
-					nextTransition = candidateTime
-				}
-			} else {
-				// currentMinutes >= startMinutes - активный период, следующее событие - окончание завтра
-				candidateTime := today.Add(24*time.Hour).Add(time.Duration(endMinutes) * time.Minute)
-				if nextTransition.IsZero() || candidateTime.Before(nextTransition) {
-					nextTransition = candidateTime
-				}
-			}
-		} else {
-			// Обычное расписание (не через полночь)
-			if currentMinutes < startMinutes {
-				// До начала - ждём начала сегодня
-				candidateTime := today.Add(time.Duration(startMinutes) * time.Minute)
-				if nextTransition.IsZero() || candidateTime.Before(nextTransition) {
-					nextTransition = candidateTime
-				}
-			} else if currentMinutes < endMinutes {
-				// Внутри периода - ждём окончания сегодня
-				candidateTime := today.Add(time.Duration(endMinutes) * time.Minute)
-				if nextTransition.IsZero() || candidateTime.Before(nextTransition) {
-					nextTransition = candidateTime
-				}
-			} else {
-				// После окончания - ждём начала завтра
-				candidateTime := today.Add(24*time.Hour).Add(time.Duration(startMinutes) * time.Minute)
-				if nextTransition.IsZero() || candidateTime.Before(nextTransition) {
-					nextTransition = candidateTime
-				}
-			}
+		// Если нашли переход на этом дне — дальше искать не нужно
+		if !nextTransition.IsZero() {
+			break
 		}
 	}
 
@@ -2650,7 +2689,7 @@ func createGroupHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Валидация имени группы
 	if !isValidName(groupName) {
-		response := Response{Desc: "Некорректное имя группы. Используйте только буквы, цифры, дефис и подчеркивание (макс. 63 символа)", Level: "error"}
+		response := Response{Desc: "Некорректное имя группы. Используйте буквы (в том числе кириллицу), цифры, дефис и подчёркивание (макс. 63 символа)", Level: "error"}
 		json.NewEncoder(w).Encode(response)
 		return
 	}
@@ -3048,6 +3087,52 @@ func main() {
 	initSettings()
 
 	manager = NewOpenWrtManager()
+
+	// Горутина авто-переподключения SSH
+	go func() {
+		backoff := autoReconnectInterval
+		const maxBackoff = 5 * time.Minute
+		for {
+			time.Sleep(backoff)
+
+			manager.mu.Lock()
+			isConnected := manager.connected
+			manager.mu.Unlock()
+
+			if isConnected {
+				backoff = autoReconnectInterval // сбрасываем backoff при живом соединении
+				continue
+			}
+
+			settings.mu.RLock()
+			autoConnect := settings.AutoConnect
+			hasHost := settings.SSHHost != ""
+			settings.mu.RUnlock()
+
+			if !autoConnect || !hasHost {
+				backoff = autoReconnectInterval
+				continue
+			}
+
+			addLog("Соединение с роутером потеряно, попытка переподключения...", "warning")
+			if err := manager.ensureConnection(); err != nil {
+				addLog(fmt.Sprintf("Авто-переподключение не удалось: %v", err), "warning")
+				// Увеличиваем интервал до следующей попытки
+				backoff *= 2
+				if backoff > maxBackoff {
+					backoff = maxBackoff
+				}
+			} else {
+				addLog("SSH авто-переподключение успешно, применяю расписания", "success")
+				backoff = autoReconnectInterval // сбрасываем после успеха
+				// Немедленно применить расписания после восстановления соединения
+				select {
+				case scheduleCheckTrigger <- struct{}{}:
+				default:
+				}
+			}
+		}
+	}()
 
 	// Планировщик для автоматического управления группами
 	go func() {
@@ -3511,6 +3596,47 @@ const htmlTemplate = `
 			background: var(--text-secondary);
 		}
 
+		.days-selector {
+			display: flex;
+			flex-wrap: wrap;
+			gap: 6px;
+			margin: 8px 0;
+		}
+
+		.day-btn {
+			display: inline-flex;
+			align-items: center;
+			justify-content: center;
+			width: 36px;
+			height: 28px;
+			border: 1px solid var(--border-color);
+			border-radius: 6px;
+			background: var(--hover-bg);
+			color: var(--text-color);
+			font-size: 12px;
+			font-weight: 500;
+			cursor: pointer;
+			user-select: none;
+			transition: background 0.15s, color 0.15s, border-color 0.15s;
+		}
+
+		.day-btn:hover {
+			border-color: var(--primary-color);
+			color: var(--primary-color);
+		}
+
+		.day-btn.active {
+			background: var(--primary-color);
+			color: #fff;
+			border-color: var(--primary-color);
+		}
+
+		.schedule-days-label {
+			font-size: 11px;
+			color: var(--text-secondary);
+			margin-top: 3px;
+		}
+
 		.time-inputs {
 			display: grid;
 			grid-template-columns: 1fr auto 1fr;
@@ -3598,6 +3724,43 @@ const htmlTemplate = `
 			box-shadow: 0 1px 3px var(--shadow-color);
 			border: 1px solid var(--border-color);
 		}
+
+		.tabs-nav {
+			display: flex;
+			border-bottom: 2px solid var(--border-color);
+			margin-bottom: 24px;
+			gap: 0;
+			overflow-x: auto;
+			-webkit-overflow-scrolling: touch;
+			scrollbar-width: none;
+		}
+
+		.tabs-nav::-webkit-scrollbar { display: none; }
+
+		.tab-btn {
+			padding: 10px 20px;
+			background: none;
+			border: none;
+			border-bottom: 3px solid transparent;
+			margin-bottom: -2px;
+			cursor: pointer;
+			font-size: 14px;
+			font-weight: 500;
+			color: var(--text-secondary);
+			white-space: nowrap;
+			transition: color 0.15s, border-color 0.15s;
+			outline: none;
+		}
+
+		.tab-btn:hover { color: var(--text-color); }
+
+		.tab-btn.active {
+			color: var(--primary-color);
+			border-bottom-color: var(--primary-color);
+		}
+
+		.tab-panel { display: none; }
+		.tab-panel.active { display: block; }
 
 		.card h3 {
 			font-size: 1.25rem;
@@ -4386,7 +4549,16 @@ const htmlTemplate = `
 		</div>
 		{{else}}
 
-		<!-- DNS Filtering Control -->
+		<!-- Tab Navigation -->
+		<div class="tabs-nav">
+			<button class="tab-btn" onclick="switchTab('filter',this)" data-tab="filter">Фильтрация DNS</button>
+			<button class="tab-btn" onclick="switchTab('tags',this)" data-tab="tags">DNS-теги</button>
+			<button class="tab-btn" onclick="switchTab('groups',this)" data-tab="groups">Группы</button>
+			<button class="tab-btn" onclick="switchTab('filterlist',this)" data-tab="filterlist">Фильтр-лист</button>
+		</div>
+
+		<!-- Tab: DNS Filtering Control -->
+		<div id="tab-filter" class="tab-panel">
 		<div class="card">
 			<h3>Управление фильтрацией DNS</h3>
 
@@ -4474,8 +4646,10 @@ const htmlTemplate = `
 			<p style="color: var(--text-secondary); font-style: italic;">Группы не созданы. Создайте теги и группы ниже.</p>
 			{{end}}
 		</div>
+		</div><!-- /tab-filter -->
 
-		<!-- Tag Management -->
+		<!-- Tab: Tag Management -->
+		<div id="tab-tags" class="tab-panel">
 		<div class="card">
 			<h3>Управление DNS-тегами</h3>
 
@@ -4545,7 +4719,10 @@ const htmlTemplate = `
 			{{end}}
 		</div>
 
-		<!-- Group Management -->
+		</div><!-- /tab-tags -->
+
+		<!-- Tab: Group Management -->
+		<div id="tab-groups" class="tab-panel">
 		<div class="card">
 			<h3>Управление группами</h3>
 
@@ -4664,7 +4841,10 @@ const htmlTemplate = `
 			{{end}}
 		</div>
 
-		<!-- Filter List Management -->
+		</div><!-- /tab-groups -->
+
+		<!-- Tab: Filter List Management -->
+		<div id="tab-filterlist" class="tab-panel">
 		<div class="card">
 			<h3>Управление фильтр листом</h3>
 			<form method="POST" action="/api/save-filter">
@@ -4685,6 +4865,8 @@ const htmlTemplate = `
 			</div>
 			{{end}}
 		</div>
+		</div><!-- /tab-filterlist -->
+
 		{{end}}
 	</div>
 
@@ -4875,8 +5057,30 @@ const htmlTemplate = `
 			return 'schedule_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
 		}
 
+		var DAY_NAMES = ['Вс', 'Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб'];
+		// Порядок отображения: Пн→Вс
+		var DAY_ORDER = [1, 2, 3, 4, 5, 6, 0];
+
+		function daysLabel(days) {
+			if (!days || days.length === 0) return 'Каждый день';
+			var sorted = DAY_ORDER.filter(function(d) { return days.indexOf(d) !== -1; });
+			return sorted.map(function(d) { return DAY_NAMES[d]; }).join(', ');
+		}
+
+		function toggleDayBtn(btn) {
+			btn.classList.toggle('active');
+		}
+
 		// Функция проверки пересечения двух расписаний
 		function schedulesOverlap(s1, s2) {
+			// Если у обоих расписаний указаны дни — проверяем наличие общего дня
+			var days1 = s1.days || [];
+			var days2 = s2.days || [];
+			if (days1.length > 0 && days2.length > 0) {
+				var hasCommonDay = days1.some(function(d) { return days2.indexOf(d) !== -1; });
+				if (!hasCommonDay) return false;
+			}
+
 			var start1 = s1.start_hour * 60 + s1.start_min;
 			var end1 = s1.end_hour * 60 + s1.end_min;
 			var start2 = s2.start_hour * 60 + s2.start_min;
@@ -4955,27 +5159,26 @@ const htmlTemplate = `
 				// Находим оригинальный индекс для операций редактирования/удаления
 				var originalIndex = currentSchedules.indexOf(schedule);
 
-				var timeText = String(schedule.start_hour).padStart(2, '0') + ':' + String(schedule.start_min).padStart(2, '0') +
-					' — ' + String(schedule.end_hour).padStart(2, '0') + ':' + String(schedule.end_min).padStart(2, '0');
+			var timeText = String(schedule.start_hour).padStart(2, '0') + ':' + String(schedule.start_min).padStart(2, '0') +
+				' — ' + String(schedule.end_hour).padStart(2, '0') + ':' + String(schedule.end_min).padStart(2, '0');
+			var daysText = daysLabel(schedule.days);
 
-				html += '<div class="schedule-item' + (schedule.enabled ? '' : ' disabled') + '">' +
-					'<div class="schedule-item-header">' +
-					'<div class="schedule-item-title">' +
-					'<label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">' +
-					'<input type="checkbox" ' + (schedule.enabled ? 'checked' : '') + ' ' +
-					'onchange="toggleScheduleItem(' + originalIndex + ', this.checked)" style="width: auto; margin: 0;">' +
-					'<span>' + timeText + '</span>' +
-					'</label>' +
-					'</div>' +
-					'<div class="schedule-item-actions">' +
-					'<button type="button" class="btn btn-primary btn-small" onclick="editScheduleItem(' + originalIndex + ')">Изменить</button>' +
-					'<button type="button" class="btn btn-danger btn-small" onclick="deleteScheduleItem(' + originalIndex + ')">Удалить</button>' +
-					'</div>' +
-					'</div>' +
-					'<div style="font-size: 12px; color: var(--text-secondary); margin-top: 4px;">' +
-					'Фильтр отключается в указанное время' +
-					'</div>' +
-					'</div>';
+			html += '<div class="schedule-item' + (schedule.enabled ? '' : ' disabled') + '">' +
+				'<div class="schedule-item-header">' +
+				'<div class="schedule-item-title">' +
+				'<label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">' +
+				'<input type="checkbox" ' + (schedule.enabled ? 'checked' : '') + ' ' +
+				'onchange="toggleScheduleItem(' + originalIndex + ', this.checked)" style="width: auto; margin: 0;">' +
+				'<span>' + timeText + '</span>' +
+				'</label>' +
+				'</div>' +
+				'<div class="schedule-item-actions">' +
+				'<button type="button" class="btn btn-primary btn-small" onclick="editScheduleItem(' + originalIndex + ')">Изменить</button>' +
+				'<button type="button" class="btn btn-danger btn-small" onclick="deleteScheduleItem(' + originalIndex + ')">Удалить</button>' +
+				'</div>' +
+				'</div>' +
+				'<div class="schedule-days-label">' + daysText + '</div>' +
+				'</div>';
 			});
 
 			container.innerHTML = html;
@@ -4990,6 +5193,7 @@ const htmlTemplate = `
 				start_min: 0,
 				end_hour: 23,
 				end_min: 0,
+				days: [],
 				_isNew: true
 			};
 
@@ -5000,6 +5204,16 @@ const htmlTemplate = `
 		// Функция редактирования расписания
 		function editScheduleItem(index) {
 			var schedule = currentSchedules[index];
+			var currentDays = schedule.days || [];
+
+			// Строим кнопки дней недели
+			var daysHtml = '<div class="days-selector">';
+			DAY_ORDER.forEach(function(d) {
+				var isActive = currentDays.indexOf(d) !== -1;
+				daysHtml += '<button type="button" class="day-btn' + (isActive ? ' active' : '') +
+					'" data-day="' + d + '" onclick="toggleDayBtn(this)">' + DAY_NAMES[d] + '</button>';
+			});
+			daysHtml += '</div>';
 
 			var html = '<div style="background: var(--card-bg); padding: 16px; border: 2px solid var(--primary-color); border-radius: 8px;">' +
 				'<h4 style="margin-bottom: 16px;">Редактирование расписания</h4>' +
@@ -5008,6 +5222,10 @@ const htmlTemplate = `
 				'<input type="checkbox" id="editEnabled" ' + (schedule.enabled ? 'checked' : '') + ' style="width: auto; margin-right: 8px;">' +
 				'Включено' +
 				'</label>' +
+				'</div>' +
+				'<div class="form-group">' +
+				'<label>Дни недели <small style="color:var(--text-secondary)">(не выбрано = каждый день)</small>:</label>' +
+				daysHtml +
 				'</div>' +
 				'<div class="form-group">' +
 				'<label>Время отключения фильтра:</label>' +
@@ -5057,13 +5275,20 @@ const htmlTemplate = `
 
 		// Функция сохранения изменений расписания
 		function saveScheduleItem(index) {
+			var days = [];
+			document.querySelectorAll('.day-btn.active').forEach(function(btn) {
+				days.push(parseInt(btn.dataset.day));
+			});
+			days.sort(function(a, b) { return a - b; });
+
 			currentSchedules[index] = {
 				id: currentSchedules[index].id,
 				enabled: document.getElementById('editEnabled').checked,
 				start_hour: parseInt(document.getElementById('editStartHour').value),
 				start_min: parseInt(document.getElementById('editStartMin').value),
 				end_hour: parseInt(document.getElementById('editEndHour').value),
-				end_min: parseInt(document.getElementById('editEndMin').value)
+				end_min: parseInt(document.getElementById('editEndMin').value),
+				days: days
 				// Удаляем флаг _isNew при сохранении
 			};
 
@@ -5152,6 +5377,34 @@ const htmlTemplate = `
 			document.getElementById('scheduleModal').style.display = 'none';
 			setTimeout(function() { location.reload(); }, 500);
 		}
+
+		/* ===== Tab navigation ===== */
+		function switchTab(tabId, btn) {
+			document.querySelectorAll('.tab-panel').forEach(function(p) {
+				p.classList.remove('active');
+			});
+			document.querySelectorAll('.tab-btn').forEach(function(b) {
+				b.classList.remove('active');
+			});
+			var panel = document.getElementById('tab-' + tabId);
+			if (panel) panel.classList.add('active');
+			if (btn) {
+				btn.classList.add('active');
+			} else {
+				var b = document.querySelector('[data-tab="' + tabId + '"]');
+				if (b) b.classList.add('active');
+			}
+			try { localStorage.setItem('activeTab', tabId); } catch(e) {}
+		}
+
+		(function initTabs() {
+			// Если открыта форма редактирования — переходим на нужную вкладку
+			var forcedTab = '{{if .EditingGroup}}groups{{else if .EditingTag}}tags{{end}}';
+			var savedTab = '';
+			try { savedTab = localStorage.getItem('activeTab') || ''; } catch(e) {}
+			var activeTab = forcedTab || savedTab || 'filter';
+			switchTab(activeTab, null);
+		})();
 
 		function removeDevice(deviceName) {
 			if (!confirm('Удалить устройство "' + deviceName + '" из всех групп?\n\nЭто действие нельзя отменить.')) {
@@ -5680,16 +5933,18 @@ const htmlTemplate = `
 							var previewContainer = statusDiv.parentElement.querySelector('.schedules-preview[data-group="' + groupName + '"]');
 							if (previewContainer && sortedSchedules.length > 0) {
 								var html = '';
-								sortedSchedules.forEach(function(schedule) {
-									var startTime = String(schedule.start_hour).padStart(2, '0') + ':' + String(schedule.start_min).padStart(2, '0');
-									var endTime = String(schedule.end_hour).padStart(2, '0') + ':' + String(schedule.end_min).padStart(2, '0');
-									var disabledClass = schedule.enabled ? '' : ' disabled';
+							sortedSchedules.forEach(function(schedule) {
+								var startTime = String(schedule.start_hour).padStart(2, '0') + ':' + String(schedule.start_min).padStart(2, '0');
+								var endTime = String(schedule.end_hour).padStart(2, '0') + ':' + String(schedule.end_min).padStart(2, '0');
+								var disabledClass = schedule.enabled ? '' : ' disabled';
+								var dl = daysLabel(schedule.days);
+								var daysHint = dl !== 'Каждый день' ? ' <span style="opacity:0.75">(' + dl + ')</span>' : '';
 
-									html += '<div class="schedule-preview-item' + disabledClass + '">' +
-										'<span class="schedule-preview-icon"></span>' +
-										'<span>' + startTime + ' — ' + endTime + '</span>' +
-										'</div>';
-								});
+								html += '<div class="schedule-preview-item' + disabledClass + '">' +
+									'<span class="schedule-preview-icon"></span>' +
+									'<span>' + startTime + ' — ' + endTime + daysHint + '</span>' +
+									'</div>';
+							});
 								previewContainer.innerHTML = html;
 							}
 						})
