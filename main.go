@@ -194,11 +194,13 @@ type PageData struct {
 	Error          string
 	DarkTheme      bool
 	FilterContent  string
+	CSRFToken      string
 }
 
 type Response struct {
-	Desc  string `json:"desc"`
-	Level string `json:"level"`
+	Desc        string            `json:"desc"`
+	Level       string            `json:"level"`
+	FieldErrors map[string]string `json:"field_errors,omitempty"`
 }
 
 type LogEntry struct {
@@ -373,7 +375,51 @@ func saveSettings() error {
 	if err != nil {
 		return err
 	}
-	return ioutil.WriteFile(filepath.Join(confDir, configFileName), data, configFilePerms)
+	return atomicWriteFile(filepath.Join(confDir, configFileName), data, configFilePerms)
+}
+
+// atomicWriteFile записывает данные во временный файл в той же директории и затем переименовывает его.
+// Это предотвращает появление частично записанных файлов при неожиданной остановке процесса.
+func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	base := filepath.Base(path)
+
+	f, err := os.CreateTemp(dir, "."+base+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpName := f.Name()
+
+	cleanup := func() {
+		_ = os.Remove(tmpName)
+		_ = f.Close()
+	}
+	defer cleanup()
+
+	if _, err := f.Write(data); err != nil {
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmpName, perm); err != nil {
+		return err
+	}
+
+	if err := os.Rename(tmpName, path); err != nil {
+		return err
+	}
+
+	// Пытаемся синхронизировать директорию, чтобы операция rename гарантированно сохранилась.
+	if dirFile, err := os.Open(dir); err == nil {
+		_ = dirFile.Sync()
+		_ = dirFile.Close()
+	}
+
+	return nil
 }
 
 func refreshAdGuardFilters() error {
@@ -541,6 +587,44 @@ func postOnlyMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// Middleware для проверки CSRF-токена (cookie-based session).
+// Клиентский JS добавляет токен в заголовок X-CSRF-Token для всех fetch POST.
+func csrfMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			next(w, r)
+			return
+		}
+
+		sess, _ := store.Get(r, "session")
+		sessionToken, _ := sess.Values["csrfToken"].(string)
+		if sessionToken == "" {
+			w.WriteHeader(http.StatusForbidden)
+			_ = json.NewEncoder(w).Encode(Response{Desc: "CSRF token missing", Level: "error"})
+			return
+		}
+
+		reqToken := r.Header.Get("X-CSRF-Token")
+		if reqToken == "" {
+			// На случай non-fetch сценариев (например, HTML form).
+			// Для multipart/form-data не парсим тело, чтобы не ломать обработчик.
+			ct := r.Header.Get("Content-Type")
+			if !strings.Contains(ct, "multipart/form-data") {
+				_ = r.ParseForm()
+				reqToken = r.FormValue("csrf_token")
+			}
+		}
+
+		if reqToken == "" || reqToken != sessionToken {
+			w.WriteHeader(http.StatusForbidden)
+			_ = json.NewEncoder(w).Encode(Response{Desc: "CSRF token mismatch", Level: "error"})
+			return
+		}
+
+		next(w, r)
+	}
+}
+
 // Композитный middleware для API endpoints
 func apiMiddleware(handler http.HandlerFunc) http.HandlerFunc {
 	return authMiddleware(jsonMiddleware(handler))
@@ -548,7 +632,15 @@ func apiMiddleware(handler http.HandlerFunc) http.HandlerFunc {
 
 // Композитный middleware для API POST endpoints
 func apiPostMiddleware(handler http.HandlerFunc) http.HandlerFunc {
-	return authMiddleware(jsonMiddleware(postOnlyMiddleware(handler)))
+	return authMiddleware(jsonMiddleware(csrfMiddleware(postOnlyMiddleware(handler))))
+}
+
+// respondJSON кодирует resp в JSON и выставляет HTTP status code.
+// Фронтенд сейчас опирается на response.json() + data.level, но status code
+// остается полезным для инструментов и интеграций.
+func respondJSON(w http.ResponseWriter, statusCode int, resp Response) {
+	w.WriteHeader(statusCode)
+	_ = json.NewEncoder(w).Encode(resp)
 }
 
 /* ==================== АВТОРИЗАЦИЯ ==================== */
@@ -560,11 +652,20 @@ func isAuthenticated(r *http.Request) bool {
 }
 
 func loginHandler(w http.ResponseWriter, r *http.Request) {
+	errorCode := r.URL.Query().Get("error")
+	errorMsg := ""
+	switch errorCode {
+	case "bad_password":
+		errorMsg = "Неверный пароль. Попробуйте ещё раз."
+	case "rate_limit":
+		errorMsg = "Слишком много попыток входа. Попробуйте позже."
+	}
+
 	if r.Method == "POST" {
 		// Rate limiting для защиты от brute-force
 		if !loginLimiter.Allow() {
-			http.Error(w, "Too many login attempts. Please try again later.", http.StatusTooManyRequests)
 			addLog("Rate limit exceeded for login attempts", "warning")
+			http.Redirect(w, r, "/?login=0&error=rate_limit", http.StatusFound)
 			return
 		}
 
@@ -602,7 +703,14 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 		} else {
 			addLog("Failed login attempt", "warning")
 			time.Sleep(bruteForceDelay) // Замедление для защиты от brute-force
+			http.Redirect(w, r, "/?login=0&error=bad_password", http.StatusFound)
+			return
 		}
+	}
+
+	errorHTML := ""
+	if errorMsg != "" {
+		errorHTML = fmt.Sprintf(`<div class="login-error">%s</div>`, errorMsg)
 	}
 
 	loginTemplate := `<!DOCTYPE html>
@@ -630,6 +738,16 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		.form-input:focus { border-color: #a8d5a8; }
 		.form-input::placeholder { color: #999; }
+		.login-error {
+			margin: 0 0 18px 0;
+			padding: 10px 12px;
+			border-radius: 6px;
+			border: 1px solid #fecaca;
+			background: #fff1f2;
+			color: #b91c1c;
+			font-size: 13px;
+			text-align: left;
+		}
 		.login-btn {
 			width: 100%; padding: 15px; border: none; border-radius: 4px;
 			background: #a8d5a8; color: #333; font-size: 16px; font-weight: 500; cursor: pointer;
@@ -642,6 +760,7 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 </head>
 <body>
 	<form class="login-container" method="POST">
+		{{ERROR_HTML}}
 		<div class="input-group">
 			<input type="password" name="password" class="form-input" placeholder="Enter Password" autofocus required>
 		</div>
@@ -651,7 +770,10 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 </html>`
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprint(w, loginTemplate)
+	// Не используем fmt.Fprintf здесь: loginTemplate содержит много '%' в CSS,
+	// и fmt воспринимает их как форматные директивы, ломая HTML.
+	page := strings.ReplaceAll(loginTemplate, "{{ERROR_HTML}}", errorHTML)
+	fmt.Fprint(w, page)
 }
 
 func logoutHandler(w http.ResponseWriter, r *http.Request) {
@@ -747,14 +869,14 @@ func (om *OpenWrtManager) disconnect() {
 }
 
 func (om *OpenWrtManager) connectSSH(host, user, password string) error {
-	// TODO: В production заменить на ssh.FixedHostKey или ssh.PublicKeyCallback
+	// TODO: В продакшене заменить на ssh.FixedHostKey или ssh.PublicKeyCallback
 	// для проверки отпечатка ключа хоста и защиты от MITM атак
 	config := &ssh.ClientConfig{
 		User: user,
 		Auth: []ssh.AuthMethod{
 			ssh.Password(password),
 		},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(), // FIXME: небезопасно для production
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(), // FIXME: небезопасно для продакшена
 		Timeout:         sshTimeout,
 	}
 
@@ -887,7 +1009,7 @@ func (om *OpenWrtManager) syncLeasetimeFromOpenWrt() error {
 		if err != nil {
 			return fmt.Errorf("failed to save synced leasetime: %w", err)
 		}
-		if err := ioutil.WriteFile(filepath.Join(confDir, configFileName), data, configFilePerms); err != nil {
+		if err := atomicWriteFile(filepath.Join(confDir, configFileName), data, configFilePerms); err != nil {
 			return fmt.Errorf("failed to save synced leasetime: %w", err)
 		}
 	}
@@ -996,7 +1118,7 @@ func saveFilterList(content string) error {
 
 	processedContent := strings.Join(processedLines, "\n")
 	filterPath := filepath.Join(listsDir, filterListFileName)
-	return ioutil.WriteFile(filterPath, []byte(processedContent), listFilePerms)
+	return atomicWriteFile(filterPath, []byte(processedContent), listFilePerms)
 }
 
 /* ==================== SCHEDULE ==================== */
@@ -1082,8 +1204,11 @@ func validateSchedules(schedules []Schedule) error {
 }
 
 // Проверка активности для массива расписаний
-func isFilterActiveBySchedules(schedules []Schedule) bool {
-	now := time.Now()
+func shouldFilterBeEnabledBySchedules(schedules []Schedule) bool {
+	return shouldFilterBeEnabledBySchedulesAt(schedules, time.Now())
+}
+
+func shouldFilterBeEnabledBySchedulesAt(schedules []Schedule, now time.Time) bool {
 	currentWeekday := int(now.Weekday())                  // 0=Вс, 1=Пн, ..., 6=Сб
 	yesterday := (currentWeekday + 6) % 7                 // предыдущий день
 	currentMinutes := now.Hour()*minutesPerHour + now.Minute()
@@ -1186,6 +1311,27 @@ func triggerScheduleCheck() {
 	}
 }
 
+func hasEnabledSchedules(schedules []Schedule) bool {
+	for _, schedule := range schedules {
+		if schedule.Enabled {
+			return true
+		}
+	}
+	return false
+}
+
+// applyGroupRuntimeState применяет желаемое runtime-состояние группы в OpenWrt
+// и синхронизирует с ним правила блокировки устройств.
+func (om *OpenWrtManager) applyGroupRuntimeState(groupName string, enabled bool) error {
+	if err := om.setGroupTag(groupName, enabled); err != nil {
+		return err
+	}
+	if err := om.syncGroupDeviceBlocks(groupName, enabled); err != nil {
+		return fmt.Errorf("sync device blocks: %w", err)
+	}
+	return nil
+}
+
 // Проверка и применение расписаний для всех групп
 func (om *OpenWrtManager) checkAndApplySchedules() {
 	if !om.connected {
@@ -1209,34 +1355,19 @@ func (om *OpenWrtManager) checkAndApplySchedules() {
 	log.Printf("Проверка расписаний в %s", now.Format("15:04:05"))
 
 	for groupName, groupConfig := range groups {
-		// Проверяем наличие активных расписаний
-		hasEnabledSchedule := false
-		for _, schedule := range groupConfig.Schedules {
-			if schedule.Enabled {
-				hasEnabledSchedule = true
-				break
-			}
-		}
-
-		if !hasEnabledSchedule {
+		if !hasEnabledSchedules(groupConfig.Schedules) {
 			continue
 		}
 
-		shouldBeActive := isFilterActiveBySchedules(groupConfig.Schedules)
+		shouldBeActive := shouldFilterBeEnabledBySchedules(groupConfig.Schedules)
 		currentlyActive := groupStates[groupName]
 
 		//log.Printf("Группа '%s': должна быть=%v, текущее состояние=%v", groupName, shouldBeActive, currentlyActive)
 
 		if shouldBeActive != currentlyActive {
-			err := om.setGroupTag(groupName, shouldBeActive)
-			if err != nil {
+			if err := om.applyGroupRuntimeState(groupName, shouldBeActive); err != nil {
 				log.Printf("Ошибка переключения группы '%s': %v", groupName, err)
 			} else {
-				// Синхронизируем firewall-блокировки
-				if syncErr := om.syncGroupDeviceBlocks(groupName, shouldBeActive); syncErr != nil {
-					log.Printf("Предупреждение: ошибка синхронизации блокировок для '%s': %v", groupName, syncErr)
-				}
-
 				status := "включён"
 				if !shouldBeActive {
 					status = "выключен"
@@ -1452,7 +1583,7 @@ func (om *OpenWrtManager) syncTagsWithOpenWrt() error {
 		if err != nil {
 			return fmt.Errorf("failed to save synced tags: %w", err)
 		}
-		if err := ioutil.WriteFile(filepath.Join(confDir, configFileName), data, configFilePerms); err != nil {
+		if err := atomicWriteFile(filepath.Join(confDir, configFileName), data, configFilePerms); err != nil {
 			return fmt.Errorf("failed to save synced tags: %w", err)
 		}
 	}
@@ -2052,6 +2183,44 @@ func statusHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func syncNowHandler(w http.ResponseWriter, r *http.Request) {
+	if !manager.connected {
+		response := Response{Desc: "Нет подключения к роутеру для синхронизации", Level: "error"}
+		respondJSON(w, http.StatusConflict, response)
+		return
+	}
+
+	var warnings []string
+
+	if err := manager.syncTagsWithOpenWrt(); err != nil {
+		warnings = append(warnings, fmt.Sprintf("теги: %v", err))
+	}
+	if err := manager.syncLeasetimeFromOpenWrt(); err != nil {
+		warnings = append(warnings, fmt.Sprintf("lease-time: %v", err))
+	}
+	if err := manager.syncDeviceBlocksFromSettings(); err != nil {
+		warnings = append(warnings, fmt.Sprintf("блокировки: %v", err))
+	}
+
+	// Применяем расписания сразу после синка.
+	manager.checkAndApplySchedules()
+
+	if len(warnings) > 0 {
+		response := Response{
+			Desc:  "Синхронизация выполнена с предупреждениями: " + strings.Join(warnings, "; "),
+			Level: "warning",
+		}
+		respondJSON(w, http.StatusOK, response)
+		return
+	}
+
+	response := Response{
+		Desc:  "Синхронизация с роутером выполнена успешно",
+		Level: "success",
+	}
+	respondJSON(w, http.StatusOK, response)
+}
+
 // Получение списка расписаний группы
 func schedulesGetHandler(w http.ResponseWriter, r *http.Request) {
 	groupName := strings.TrimPrefix(r.URL.Path, "/api/schedules/")
@@ -2067,6 +2236,29 @@ func schedulesGetHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func groupStateHandler(w http.ResponseWriter, r *http.Request) {
+	groupName := strings.TrimPrefix(r.URL.Path, "/api/group-state/")
+	if groupName == "" {
+		respondJSON(w, http.StatusBadRequest, Response{Desc: "Группа не указана", Level: "error"})
+		return
+	}
+
+	if !manager.connected {
+		json.NewEncoder(w).Encode(map[string]bool{"active": false})
+		return
+	}
+
+	groupStates, _, err := manager.getGroupStates()
+	if err != nil {
+		respondJSON(w, http.StatusInternalServerError, Response{Desc: fmt.Sprintf("Ошибка получения состояния группы: %v", err), Level: "error"})
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]bool{
+		"active": groupStates[groupName],
+	})
+}
+
 // Сохранение массива расписаний
 func schedulesSaveHandler(w http.ResponseWriter, r *http.Request) {
 	groupName := r.FormValue("group_name")
@@ -2075,7 +2267,7 @@ func schedulesSaveHandler(w http.ResponseWriter, r *http.Request) {
 	var schedules []Schedule
 	if err := json.Unmarshal([]byte(schedulesJSON), &schedules); err != nil {
 		response := Response{Desc: fmt.Sprintf("Ошибка парсинга расписаний: %v", err), Level: "error"}
-		json.NewEncoder(w).Encode(response)
+		respondJSON(w, http.StatusBadRequest, response)
 		return
 	}
 
@@ -2083,22 +2275,22 @@ func schedulesSaveHandler(w http.ResponseWriter, r *http.Request) {
 	for i, s := range schedules {
 		if s.StartHour < 0 || s.StartHour > 23 {
 			response := Response{Desc: fmt.Sprintf("Расписание %d: некорректные часы начала (0-23)", i+1), Level: "error"}
-			json.NewEncoder(w).Encode(response)
+			respondJSON(w, http.StatusBadRequest, response)
 			return
 		}
 		if s.EndHour < 0 || s.EndHour > 23 {
 			response := Response{Desc: fmt.Sprintf("Расписание %d: некорректные часы окончания (0-23)", i+1), Level: "error"}
-			json.NewEncoder(w).Encode(response)
+			respondJSON(w, http.StatusBadRequest, response)
 			return
 		}
 		if s.StartMin < 0 || s.StartMin > 59 {
 			response := Response{Desc: fmt.Sprintf("Расписание %d: некорректные минуты начала (0-59)", i+1), Level: "error"}
-			json.NewEncoder(w).Encode(response)
+			respondJSON(w, http.StatusBadRequest, response)
 			return
 		}
 		if s.EndMin < 0 || s.EndMin > 59 {
 			response := Response{Desc: fmt.Sprintf("Расписание %d: некорректные минуты окончания (0-59)", i+1), Level: "error"}
-			json.NewEncoder(w).Encode(response)
+			respondJSON(w, http.StatusBadRequest, response)
 			return
 		}
 	}
@@ -2106,7 +2298,7 @@ func schedulesSaveHandler(w http.ResponseWriter, r *http.Request) {
 	// Валидация на пересечения
 	if err := validateSchedules(schedules); err != nil {
 		response := Response{Desc: fmt.Sprintf("Ошибка валидации: %v", err), Level: "error"}
-		json.NewEncoder(w).Encode(response)
+		respondJSON(w, http.StatusBadRequest, response)
 		return
 	}
 
@@ -2120,17 +2312,17 @@ func schedulesSaveHandler(w http.ResponseWriter, r *http.Request) {
 
 	if !exists {
 		response := Response{Desc: "Группа не найдена", Level: "error"}
-		json.NewEncoder(w).Encode(response)
+		respondJSON(w, http.StatusNotFound, response)
 		return
 	}
 
 	if err := saveSettings(); err != nil {
 		response := Response{Desc: fmt.Sprintf("Ошибка сохранения: %v", err), Level: "error"}
-		json.NewEncoder(w).Encode(response)
+		respondJSON(w, http.StatusInternalServerError, response)
 	} else {
 		triggerScheduleCheck()
 		response := Response{Desc: "Расписания сохранены", Level: "success"}
-		json.NewEncoder(w).Encode(response)
+		respondJSON(w, http.StatusOK, response)
 	}
 }
 
@@ -2170,16 +2362,16 @@ func disableActionSaveHandler(w http.ResponseWriter, r *http.Request) {
 
 	if !exists {
 		response := Response{Desc: "Группа не найдена", Level: "error"}
-		json.NewEncoder(w).Encode(response)
+		respondJSON(w, http.StatusNotFound, response)
 		return
 	}
 
 	if err := saveSettings(); err != nil {
 		response := Response{Desc: fmt.Sprintf("Ошибка сохранения: %v", err), Level: "error"}
-		json.NewEncoder(w).Encode(response)
+		respondJSON(w, http.StatusInternalServerError, response)
 	} else {
 		response := Response{Desc: "Настройки действия сохранены", Level: "success"}
-		json.NewEncoder(w).Encode(response)
+		respondJSON(w, http.StatusOK, response)
 	}
 }
 
@@ -2218,7 +2410,7 @@ func leasetimeSaveHandler(w http.ResponseWriter, r *http.Request) {
 			if err != nil || leasetime < 0 || leasetime > maxLeasetimeValue {
 				settings.mu.Unlock()
 				response := Response{Desc: fmt.Sprintf("Некорректное значение срока аренды (0-%d минут)", maxLeasetimeValue), Level: "error"}
-				json.NewEncoder(w).Encode(response)
+				respondJSON(w, http.StatusBadRequest, response)
 				return
 			}
 			groupConfig.Leasetime = &leasetime
@@ -2229,13 +2421,13 @@ func leasetimeSaveHandler(w http.ResponseWriter, r *http.Request) {
 
 	if !exists {
 		response := Response{Desc: "Группа не найдена", Level: "error"}
-		json.NewEncoder(w).Encode(response)
+		respondJSON(w, http.StatusNotFound, response)
 		return
 	}
 
 	if err := saveSettings(); err != nil {
 		response := Response{Desc: fmt.Sprintf("Ошибка сохранения: %v", err), Level: "error"}
-		json.NewEncoder(w).Encode(response)
+		respondJSON(w, http.StatusInternalServerError, response)
 	} else {
 		// Применяем изменения в OpenWrt если подключены
 		if manager.connected {
@@ -2244,7 +2436,7 @@ func leasetimeSaveHandler(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		response := Response{Desc: "Настройки срока аренды сохранены", Level: "success"}
-		json.NewEncoder(w).Encode(response)
+		respondJSON(w, http.StatusOK, response)
 	}
 }
 
@@ -2279,7 +2471,7 @@ func blockDeviceSaveHandler(w http.ResponseWriter, r *http.Request) {
 	if !exists {
 		settings.mu.Unlock()
 		response := Response{Desc: "Группа не найдена", Level: "error"}
-		json.NewEncoder(w).Encode(response)
+		respondJSON(w, http.StatusNotFound, response)
 		return
 	}
 
@@ -2312,7 +2504,7 @@ func blockDeviceSaveHandler(w http.ResponseWriter, r *http.Request) {
 
 	if err := saveSettings(); err != nil {
 		response := Response{Desc: fmt.Sprintf("Ошибка сохранения: %v", err), Level: "error"}
-		json.NewEncoder(w).Encode(response)
+		respondJSON(w, http.StatusInternalServerError, response)
 		return
 	}
 
@@ -2330,7 +2522,7 @@ func blockDeviceSaveHandler(w http.ResponseWriter, r *http.Request) {
 		if err := manager.applyDeviceInternetBlock(groupName, deviceName, block); err != nil {
 			log.Printf("Ошибка применения блокировки: %v", err)
 			response := Response{Desc: fmt.Sprintf("Настройка сохранена, но ошибка применения: %v", err), Level: "warning"}
-			json.NewEncoder(w).Encode(response)
+			respondJSON(w, http.StatusOK, response)
 			return
 		}
 	}
@@ -2347,7 +2539,7 @@ func blockDeviceSaveHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	response := Response{Desc: fmt.Sprintf("Устройство %s", status), Level: "success"}
-	json.NewEncoder(w).Encode(response)
+	respondJSON(w, http.StatusOK, response)
 }
 
 func adguardSettingsHandler(w http.ResponseWriter, r *http.Request) {
@@ -2364,7 +2556,7 @@ func adguardSettingsHandler(w http.ResponseWriter, r *http.Request) {
 		encryptedPass, err := encrypt(newPass)
 		if err != nil {
 			settings.mu.Unlock()
-			json.NewEncoder(w).Encode(Response{
+			respondJSON(w, http.StatusInternalServerError, Response{
 				Desc:  fmt.Sprintf("Ошибка шифрования пароля: %v", err),
 				Level: "error",
 			})
@@ -2375,14 +2567,14 @@ func adguardSettingsHandler(w http.ResponseWriter, r *http.Request) {
 	settings.mu.Unlock()
 
 	if err := saveSettings(); err != nil {
-		json.NewEncoder(w).Encode(Response{
+		respondJSON(w, http.StatusInternalServerError, Response{
 			Desc:  fmt.Sprintf("Ошибка сохранения: %v", err),
 			Level: "error",
 		})
 		return
 	}
 
-	json.NewEncoder(w).Encode(Response{
+	respondJSON(w, http.StatusOK, Response{
 		Desc:  "Настройки AdGuard Home сохранены",
 		Level: "success",
 	})
@@ -2410,6 +2602,19 @@ func connectHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if r.Method == "POST" {
+		// CSRF check for cookie-based session POST.
+		sess, _ := store.Get(r, "session")
+		sessionToken, _ := sess.Values["csrfToken"].(string)
+		reqToken := r.Header.Get("X-CSRF-Token")
+		if reqToken == "" {
+			reqToken = r.FormValue("csrf_token")
+		}
+		if sessionToken == "" || reqToken == "" || reqToken != sessionToken {
+			addLog("CSRF token mismatch on /connect", "warning")
+			http.Redirect(w, r, "/?error=csrf_failed", http.StatusFound)
+			return
+		}
+
 		host := strings.TrimSpace(r.FormValue("host"))
 		user := strings.TrimSpace(r.FormValue("user"))
 		password := r.FormValue("password")
@@ -2474,7 +2679,7 @@ func toggleHandler(w http.ResponseWriter, r *http.Request) {
 
 	if !manager.connected {
 		response := Response{Desc: "Нет подключения к роутеру", Level: "error"}
-		json.NewEncoder(w).Encode(response)
+		respondJSON(w, http.StatusConflict, response)
 		return
 	}
 
@@ -2482,16 +2687,11 @@ func toggleHandler(w http.ResponseWriter, r *http.Request) {
 	currentState := groupStates[group]
 	newState := !currentState
 
-	err := manager.setGroupTag(group, newState)
+	err := manager.applyGroupRuntimeState(group, newState)
 	if err != nil {
 		response := Response{Desc: fmt.Sprintf("Ошибка: %v", err), Level: "error"}
-		json.NewEncoder(w).Encode(response)
+		respondJSON(w, http.StatusInternalServerError, response)
 	} else {
-		// Синхронизируем firewall-блокировки устройств
-		if syncErr := manager.syncGroupDeviceBlocks(group, newState); syncErr != nil {
-			log.Printf("Предупреждение: ошибка синхронизации блокировок для группы %s: %v", group, syncErr)
-		}
-
 		// Отключаем все расписания при ручном переключении
 		settings.mu.Lock()
 		groupConfig, exists := settings.Groups[group]
@@ -2523,7 +2723,7 @@ func toggleHandler(w http.ResponseWriter, r *http.Request) {
 			status = "выключен"
 		}
 		response := Response{Desc: fmt.Sprintf("Фильтр группы '%s' %s", group, status), Level: "success"}
-		json.NewEncoder(w).Encode(response)
+		respondJSON(w, http.StatusOK, response)
 	}
 }
 
@@ -2578,7 +2778,7 @@ func createTagHandler(w http.ResponseWriter, r *http.Request) {
 		// Если не multipart, пробуем ParseForm
 		if err := r.ParseForm(); err != nil {
 			response := Response{Desc: fmt.Sprintf("Ошибка парсинга формы: %v", err), Level: "error"}
-			json.NewEncoder(w).Encode(response)
+			respondJSON(w, http.StatusBadRequest, response)
 			return
 		}
 	}
@@ -2588,14 +2788,26 @@ func createTagHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Валидация имени тега
 	if !isValidName(tagName) {
-		response := Response{Desc: "Некорректное имя тега. Используйте только буквы, цифры, дефис и подчеркивание (макс. 63 символа)", Level: "error"}
-		json.NewEncoder(w).Encode(response)
+		response := Response{
+			Desc:  "Некорректное имя тега. Используйте только буквы, цифры, дефис и подчеркивание (макс. 63 символа)",
+			Level: "error",
+			FieldErrors: map[string]string{
+				"tagname": "Некорректное имя тега. Допустимы буквы/цифры/дефис/подчеркивание.",
+			},
+		}
+		respondJSON(w, http.StatusBadRequest, response)
 		return
 	}
 
 	if dhcpOptionsStr == "" {
-		response := Response{Desc: "Заполните все поля", Level: "error"}
-		json.NewEncoder(w).Encode(response)
+		response := Response{
+			Desc:  "Заполните все поля",
+			Level: "error",
+			FieldErrors: map[string]string{
+				"dhcpoptions": "Заполните DHCP опции (каждая на отдельной строке).",
+			},
+		}
+		respondJSON(w, http.StatusBadRequest, response)
 		return
 	}
 
@@ -2605,8 +2817,14 @@ func createTagHandler(w http.ResponseWriter, r *http.Request) {
 	settings.mu.RUnlock()
 
 	if exists {
-		response := Response{Desc: fmt.Sprintf("Тег '%s' уже существует", tagName), Level: "error"}
-		json.NewEncoder(w).Encode(response)
+		response := Response{
+			Desc:  fmt.Sprintf("Тег '%s' уже существует", tagName),
+			Level: "error",
+			FieldErrors: map[string]string{
+				"tagname": fmt.Sprintf("Тег '%s' уже существует", tagName),
+			},
+		}
+		respondJSON(w, http.StatusConflict, response)
 		return
 	}
 
@@ -2620,15 +2838,21 @@ func createTagHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if len(options) == 0 {
-		response := Response{Desc: "Добавьте хотя бы одну DHCP опцию", Level: "error"}
-		json.NewEncoder(w).Encode(response)
+		response := Response{
+			Desc:  "Добавьте хотя бы одну DHCP опцию",
+			Level: "error",
+			FieldErrors: map[string]string{
+				"dhcpoptions": "Добавьте хотя бы одну DHCP опцию.",
+			},
+		}
+		respondJSON(w, http.StatusBadRequest, response)
 		return
 	}
 
 	// Создание тега в OpenWrt
 	if err := manager.createTag(tagName, options); err != nil {
 		response := Response{Desc: fmt.Sprintf("Ошибка создания тега: %v", err), Level: "error"}
-		json.NewEncoder(w).Encode(response)
+		respondJSON(w, http.StatusInternalServerError, response)
 	} else {
 		settings.mu.Lock()
 		settings.Tags[tagName] = TagConfig{DHCPOptions: options}
@@ -2636,10 +2860,10 @@ func createTagHandler(w http.ResponseWriter, r *http.Request) {
 
 		if err := saveSettings(); err != nil {
 			response := Response{Desc: fmt.Sprintf("Ошибка сохранения: %v", err), Level: "error"}
-			json.NewEncoder(w).Encode(response)
+			respondJSON(w, http.StatusInternalServerError, response)
 		} else {
 			response := Response{Desc: fmt.Sprintf("Тег '%s' создан (%d опций)", tagName, len(options)), Level: "success"}
-			json.NewEncoder(w).Encode(response)
+			respondJSON(w, http.StatusOK, response)
 		}
 	}
 }
@@ -2653,13 +2877,13 @@ func deleteTagHandler(w http.ResponseWriter, r *http.Request) {
 
 	if !exists {
 		response := Response{Desc: fmt.Sprintf("Тег %s не найден", tagName), Level: "error"}
-		json.NewEncoder(w).Encode(response)
+		respondJSON(w, http.StatusNotFound, response)
 		return
 	}
 
 	if err := manager.deleteTag(tagName); err != nil {
 		response := Response{Desc: fmt.Sprintf("Ошибка удаления тега: %v", err), Level: "error"}
-		json.NewEncoder(w).Encode(response)
+		respondJSON(w, http.StatusInternalServerError, response)
 	} else {
 		settings.mu.Lock()
 		delete(settings.Tags, tagName)
@@ -2667,10 +2891,10 @@ func deleteTagHandler(w http.ResponseWriter, r *http.Request) {
 
 		if err := saveSettings(); err != nil {
 			response := Response{Desc: fmt.Sprintf("Ошибка сохранения: %v", err), Level: "error"}
-			json.NewEncoder(w).Encode(response)
+			respondJSON(w, http.StatusInternalServerError, response)
 		} else {
 			response := Response{Desc: fmt.Sprintf("Тег %s удалён", tagName), Level: "success"}
-			json.NewEncoder(w).Encode(response)
+			respondJSON(w, http.StatusOK, response)
 		}
 	}
 }
@@ -2679,7 +2903,7 @@ func createGroupHandler(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseMultipartForm(maxFormMemory); err != nil {
 		if err := r.ParseForm(); err != nil {
 			response := Response{Desc: fmt.Sprintf("Ошибка парсинга формы: %v", err), Level: "error"}
-			json.NewEncoder(w).Encode(response)
+			respondJSON(w, http.StatusBadRequest, response)
 			return
 		}
 	}
@@ -2690,14 +2914,14 @@ func createGroupHandler(w http.ResponseWriter, r *http.Request) {
 	// Валидация имени группы
 	if !isValidName(groupName) {
 		response := Response{Desc: "Некорректное имя группы. Используйте буквы (в том числе кириллицу), цифры, дефис и подчёркивание (макс. 63 символа)", Level: "error"}
-		json.NewEncoder(w).Encode(response)
+		respondJSON(w, http.StatusBadRequest, response)
 		return
 	}
 
 	// Валидация имени тега
 	if !isValidName(tag) {
 		response := Response{Desc: "Некорректное имя тега", Level: "error"}
-		json.NewEncoder(w).Encode(response)
+		respondJSON(w, http.StatusBadRequest, response)
 		return
 	}
 
@@ -2707,7 +2931,7 @@ func createGroupHandler(w http.ResponseWriter, r *http.Request) {
 
 	if exists {
 		response := Response{Desc: fmt.Sprintf("Группа '%s' уже существует", groupName), Level: "error"}
-		json.NewEncoder(w).Encode(response)
+		respondJSON(w, http.StatusConflict, response)
 		return
 	}
 
@@ -2718,7 +2942,7 @@ func createGroupHandler(w http.ResponseWriter, r *http.Request) {
 	for _, device := range devices {
 		if !isValidDeviceName(device) {
 			response := Response{Desc: fmt.Sprintf("Некорректное имя устройства: %s", device), Level: "error"}
-			json.NewEncoder(w).Encode(response)
+			respondJSON(w, http.StatusBadRequest, response)
 			return
 		}
 	}
@@ -2733,10 +2957,10 @@ func createGroupHandler(w http.ResponseWriter, r *http.Request) {
 
 	if err := saveSettings(); err != nil {
 		response := Response{Desc: fmt.Sprintf("Ошибка сохранения: %v", err), Level: "error"}
-		json.NewEncoder(w).Encode(response)
+		respondJSON(w, http.StatusInternalServerError, response)
 	} else {
 		response := Response{Desc: fmt.Sprintf("Группа '%s' создана", groupName), Level: "success"}
-		json.NewEncoder(w).Encode(response)
+		respondJSON(w, http.StatusOK, response)
 	}
 }
 
@@ -2744,18 +2968,18 @@ func updateGroupHandler(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseMultipartForm(maxFormMemory); err != nil {
 		if err := r.ParseForm(); err != nil {
 			response := Response{Desc: fmt.Sprintf("Ошибка парсинга формы: %v", err), Level: "error"}
-			json.NewEncoder(w).Encode(response)
+			respondJSON(w, http.StatusBadRequest, response)
 			return
 		}
 	}
 
-	groupName := r.FormValue("groupname")
+	groupName := strings.TrimSpace(r.FormValue("groupname"))
 	tag := strings.TrimSpace(r.FormValue("tag"))
 
 	// Валидация имени тега
 	if !isValidName(tag) {
 		response := Response{Desc: "Некорректное имя тега", Level: "error"}
-		json.NewEncoder(w).Encode(response)
+		respondJSON(w, http.StatusBadRequest, response)
 		return
 	}
 
@@ -2765,7 +2989,7 @@ func updateGroupHandler(w http.ResponseWriter, r *http.Request) {
 
 	if !exists {
 		response := Response{Desc: fmt.Sprintf("Группа '%s' не найдена", groupName), Level: "error"}
-		json.NewEncoder(w).Encode(response)
+		respondJSON(w, http.StatusNotFound, response)
 		return
 	}
 
@@ -2776,53 +3000,72 @@ func updateGroupHandler(w http.ResponseWriter, r *http.Request) {
 	for _, device := range devices {
 		if !isValidDeviceName(device) {
 			response := Response{Desc: fmt.Sprintf("Некорректное имя устройства: %s", device), Level: "error"}
-			json.NewEncoder(w).Encode(response)
+			respondJSON(w, http.StatusBadRequest, response)
 			return
 		}
 	}
 
-	// Обновление устройств в OpenWrt
+	var openWrtWarnings []string
+	currentlyActive := false
 	if manager.connected {
-		if err := manager.updateGroupDevices(groupName, oldGroupConfig.Devices, devices, oldGroupConfig.Tag); err != nil {
-			log.Printf("Ошибка удаления тегов со старых устройств: %v", err)
-		}
-
-		// Проверяем текущее состояние группы перед назначением тега новым устройствам
 		groupStates, _, _ := manager.getGroupStates()
-		isGroupActive := groupStates[groupName]
-
-		// Назначаем тег только если группа активна (фильтр включён)
-		if isGroupActive {
-			if err := manager.setTagsOnNewDevices(groupName, oldGroupConfig.Devices, devices, tag); err != nil {
-				log.Printf("Ошибка установки тегов на новые устройства: %v", err)
-			}
-		}
-
-		// Применяем DHCP lease для всех устройств группы (включая новые)
-		if err := manager.applyLeasetime(groupName, GroupConfig{
-			Devices:   devices,
-			Leasetime: oldGroupConfig.Leasetime,
-		}); err != nil {
-			log.Printf("Ошибка применения DHCP lease на устройства: %v", err)
-		}
+		currentlyActive = groupStates[groupName]
 	}
 
+	// 1) Сначала сохраняем новую конфигурацию группы в памяти.
 	settings.mu.Lock()
 	settings.Groups[groupName] = GroupConfig{
 		Devices:       devices,
 		Tag:           tag,
-		Schedules:     oldGroupConfig.Schedules, // Сохраняем расписания
+		Schedules:     oldGroupConfig.Schedules,
 		DisableAction: oldGroupConfig.DisableAction,
 		Leasetime:     oldGroupConfig.Leasetime,
 	}
 	settings.mu.Unlock()
 
+	// 2) Применяем изменения в OpenWrt.
+	if manager.connected {
+		// Убираем старые теги с устройств, которых больше нет в группе.
+		if err := manager.updateGroupDevices(groupName, oldGroupConfig.Devices, devices, oldGroupConfig.Tag); err != nil {
+			openWrtWarnings = append(openWrtWarnings, fmt.Sprintf("remove old tag: %v", err))
+		}
+
+		// Если группа управляется расписаниями — runtime определяется расписанием.
+		// Иначе сохраняем текущее runtime-состояние (включена/выключена) при редактировании.
+		shouldBeActiveNow := currentlyActive
+		if hasEnabledSchedules(oldGroupConfig.Schedules) {
+			shouldBeActiveNow = shouldFilterBeEnabledBySchedulesAt(oldGroupConfig.Schedules, time.Now())
+		}
+
+		if err := manager.applyGroupRuntimeState(groupName, shouldBeActiveNow); err != nil {
+			response := Response{Desc: fmt.Sprintf("Ошибка применения тега в OpenWrt: %v", err), Level: "error"}
+			respondJSON(w, http.StatusInternalServerError, response)
+			return
+		}
+
+		// 4) Применяем DHCP lease для всех устройств группы (включая новые)
+		if err := manager.applyLeasetime(groupName, GroupConfig{
+			Devices:   devices,
+			Leasetime: oldGroupConfig.Leasetime,
+		}); err != nil {
+			openWrtWarnings = append(openWrtWarnings, fmt.Sprintf("apply leasetime: %v", err))
+		}
+	}
+
 	if err := saveSettings(); err != nil {
 		response := Response{Desc: fmt.Sprintf("Ошибка сохранения: %v", err), Level: "error"}
-		json.NewEncoder(w).Encode(response)
+		respondJSON(w, http.StatusInternalServerError, response)
 	} else {
 		response := Response{Desc: fmt.Sprintf("Группа '%s' обновлена", groupName), Level: "success"}
-		json.NewEncoder(w).Encode(response)
+		if len(openWrtWarnings) > 0 {
+			response.Level = "warning"
+			response.Desc = fmt.Sprintf(
+				"Группа '%s' обновлена, но есть предупреждения: %s",
+				groupName,
+				strings.Join(openWrtWarnings, "; "),
+			)
+		}
+		respondJSON(w, http.StatusOK, response)
 	}
 }
 
@@ -2830,7 +3073,7 @@ func updateTagHandler(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseMultipartForm(maxFormMemory); err != nil {
 		if err := r.ParseForm(); err != nil {
 			response := Response{Desc: fmt.Sprintf("Ошибка парсинга формы: %v", err), Level: "error"}
-			json.NewEncoder(w).Encode(response)
+			respondJSON(w, http.StatusBadRequest, response)
 			return
 		}
 	}
@@ -2838,9 +3081,16 @@ func updateTagHandler(w http.ResponseWriter, r *http.Request) {
 	tagName := r.FormValue("tagname")
 	dhcpOptionsStr := strings.TrimSpace(r.FormValue("dhcpoptions"))
 
-	if tagName == "" || dhcpOptionsStr == "" {
-		response := Response{Desc: "Заполните все поля", Level: "error"}
-		json.NewEncoder(w).Encode(response)
+	fieldErrors := map[string]string{}
+	if tagName == "" {
+		fieldErrors["tagname"] = "Некорректное имя тега."
+	}
+	if dhcpOptionsStr == "" {
+		fieldErrors["dhcpoptions"] = "Заполните DHCP опции (каждая на отдельной строке)."
+	}
+	if len(fieldErrors) > 0 {
+		response := Response{Desc: "Заполните все поля", Level: "error", FieldErrors: fieldErrors}
+		respondJSON(w, http.StatusBadRequest, response)
 		return
 	}
 
@@ -2849,8 +3099,14 @@ func updateTagHandler(w http.ResponseWriter, r *http.Request) {
 	settings.mu.RUnlock()
 
 	if !exists {
-		response := Response{Desc: fmt.Sprintf("Тег '%s' не найден", tagName), Level: "error"}
-		json.NewEncoder(w).Encode(response)
+		response := Response{
+			Desc:  fmt.Sprintf("Тег '%s' не найден", tagName),
+			Level: "error",
+			FieldErrors: map[string]string{
+				"tagname": fmt.Sprintf("Тег '%s' не найден", tagName),
+			},
+		}
+		respondJSON(w, http.StatusNotFound, response)
 		return
 	}
 
@@ -2863,8 +3119,14 @@ func updateTagHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if len(options) == 0 {
-		response := Response{Desc: "Добавьте хотя бы одну DHCP опцию", Level: "error"}
-		json.NewEncoder(w).Encode(response)
+		response := Response{
+			Desc:  "Добавьте хотя бы одну DHCP опцию",
+			Level: "error",
+			FieldErrors: map[string]string{
+				"dhcpoptions": "Добавьте хотя бы одну DHCP опцию.",
+			},
+		}
+		respondJSON(w, http.StatusBadRequest, response)
 		return
 	}
 
@@ -2874,7 +3136,7 @@ func updateTagHandler(w http.ResponseWriter, r *http.Request) {
 
 	if err := manager.createTag(tagName, options); err != nil {
 		response := Response{Desc: fmt.Sprintf("Ошибка обновления тега: %v", err), Level: "error"}
-		json.NewEncoder(w).Encode(response)
+		respondJSON(w, http.StatusInternalServerError, response)
 	} else {
 		settings.mu.Lock()
 		settings.Tags[tagName] = TagConfig{DHCPOptions: options}
@@ -2882,10 +3144,10 @@ func updateTagHandler(w http.ResponseWriter, r *http.Request) {
 
 		if err := saveSettings(); err != nil {
 			response := Response{Desc: fmt.Sprintf("Ошибка сохранения: %v", err), Level: "error"}
-			json.NewEncoder(w).Encode(response)
+			respondJSON(w, http.StatusInternalServerError, response)
 		} else {
 			response := Response{Desc: fmt.Sprintf("Тег '%s' обновлён", tagName), Level: "success"}
-			json.NewEncoder(w).Encode(response)
+			respondJSON(w, http.StatusOK, response)
 		}
 	}
 }
@@ -2899,7 +3161,7 @@ func deleteGroupHandler(w http.ResponseWriter, r *http.Request) {
 
 	if !exists {
 		response := Response{Desc: fmt.Sprintf("Группа %s не найдена", groupName), Level: "error"}
-		json.NewEncoder(w).Encode(response)
+		respondJSON(w, http.StatusNotFound, response)
 		return
 	}
 
@@ -2909,10 +3171,10 @@ func deleteGroupHandler(w http.ResponseWriter, r *http.Request) {
 
 	if err := saveSettings(); err != nil {
 		response := Response{Desc: fmt.Sprintf("Ошибка сохранения: %v", err), Level: "error"}
-		json.NewEncoder(w).Encode(response)
+		respondJSON(w, http.StatusInternalServerError, response)
 	} else {
 		response := Response{Desc: fmt.Sprintf("Группа %s удалена", groupName), Level: "success"}
-		json.NewEncoder(w).Encode(response)
+		respondJSON(w, http.StatusOK, response)
 	}
 }
 
@@ -2921,22 +3183,22 @@ func saveFilterHandler(w http.ResponseWriter, r *http.Request) {
 
 	if err := saveFilterList(filterContent); err != nil {
 		response := Response{Desc: fmt.Sprintf("Ошибка сохранения: %v", err), Level: "error"}
-		json.NewEncoder(w).Encode(response)
+		respondJSON(w, http.StatusInternalServerError, response)
 	} else {
 		// Обновляем фильтры в AdGuard Home
 		if err := refreshAdGuardFilters(); err != nil {
 			log.Printf("Warning: Failed to refresh AdGuard filters: %v", err)
 			// Файл сохранен, но AdGuard не обновлен - показываем предупреждение
 			response := Response{Desc: "Фильтр лист сохранён, но не удалось обновить AdGuard Home", Level: "warning"}
-			json.NewEncoder(w).Encode(response)
+			respondJSON(w, http.StatusOK, response)
 		} else {
 			response := Response{Desc: "Фильтр лист сохранён и обновлён в AdGuard Home", Level: "success"}
-			json.NewEncoder(w).Encode(response)
+			respondJSON(w, http.StatusOK, response)
 		}
 	}
 }
 
-func getPageData() PageData {
+func getPageData(csrfToken string) PageData {
 	settings.mu.RLock()
 	settingsCopy := Settings{
 		Groups:      make(map[string]GroupConfig),
@@ -2965,6 +3227,7 @@ func getPageData() PageData {
 		HostStates:    make(map[string]string),
 		ExistingHosts: []string{},
 		FilterContent: loadFilterList(),
+		CSRFToken:     csrfToken,
 	}
 
 	themeMutex.RLock()
@@ -3181,9 +3444,11 @@ func main() {
 	// API endpoints с middleware
 	mux.HandleFunc("/api/theme", apiPostMiddleware(themeHandler))
 	mux.HandleFunc("/api/status", apiMiddleware(statusHandler))
+	mux.HandleFunc("/api/sync-now", apiPostMiddleware(syncNowHandler))
 
 	// Endpoints для массива расписаний
 	mux.HandleFunc("/api/schedules/", apiMiddleware(schedulesGetHandler))
+	mux.HandleFunc("/api/group-state/", apiMiddleware(groupStateHandler))
 	mux.HandleFunc("/api/schedules-save", apiPostMiddleware(schedulesSaveHandler))
 
 	mux.HandleFunc("/api/disable-action/", apiMiddleware(disableActionGetHandler))
@@ -3212,7 +3477,21 @@ func main() {
 			return
 		}
 
-		data := getPageData()
+		// CSRF token для POST-запросов (используется клиентским JS).
+		sess, _ := store.Get(r, "session")
+		csrfToken, _ := sess.Values["csrfToken"].(string)
+		if csrfToken == "" {
+			var err error
+			csrfToken, err = generateRandomString(32)
+			if err == nil {
+				sess.Values["csrfToken"] = csrfToken
+				if saveErr := sess.Save(r, w); saveErr != nil {
+					log.Printf("Failed to save CSRF token: %v", saveErr)
+				}
+			}
+		}
+
+		data := getPageData(csrfToken)
 
 		// Проверяем параметр редактирования группы
 		if editGroup := r.URL.Query().Get("edit"); editGroup != "" {
@@ -3427,6 +3706,10 @@ const htmlTemplate = `
 			display: flex;
 			align-items: center;
 			gap: 8px;
+		}
+
+		.sync-now-btn {
+			white-space: nowrap;
 		}
 
 		.theme-toggle {
@@ -3786,6 +4069,13 @@ const htmlTemplate = `
 			font-size: 12px;
 			color: var(--text-secondary);
 			margin-top: 4px;
+		}
+
+		.field-error {
+			font-size: 12px;
+			color: var(--danger-color);
+			margin-top: 6px;
+			min-height: 16px; /* чтобы форма не "прыгала" при показе/скрытии ошибок */
 		}
 
 		input, select, textarea {
@@ -4159,7 +4449,7 @@ const htmlTemplate = `
 			font-weight: 500;
 			font-size: 14px;
 			z-index: 1000;
-			transform: translateY(-120%);
+			transform: translateY(-200%);
 			transition: transform 0.4s cubic-bezier(0.68, -0.55, 0.265, 1.55);
 			border: 1px solid;
 			word-wrap: break-word;
@@ -4340,10 +4630,27 @@ const htmlTemplate = `
 				margin-bottom: 10px;
 				padding: 8px 16px;
 				border-radius: 0;
+				display: flex;
+				flex-wrap: wrap;
+				justify-content: center;
+				align-items: center;
+				column-gap: 10px;
+				row-gap: 8px;
 			}
 
 			.connection-info {
 				font-size: 13px;
+				width: 100%;
+				flex-wrap: wrap;
+				justify-content: center;
+			}
+
+			.theme-toggle-container {
+				order: 3;
+			}
+
+			.sync-now-btn {
+				order: 2;
 			}
 
 			.group-item {
@@ -4488,6 +4795,9 @@ const htmlTemplate = `
 			<button onclick="location.href='/logout'" class="btn btn-secondary btn-small">Выйти</button>
 			{{end}}
 		</div>
+		{{if .Connected}}
+		<button type="button" onclick="syncNow()" class="btn btn-secondary btn-small sync-now-btn">Синхронизироваться с роутером</button>
+		{{end}}
 
 		<div class="theme-toggle-container">
 			<span style="font-size: 12px; color: var(--text-secondary);">Тема:</span>
@@ -4509,6 +4819,7 @@ const htmlTemplate = `
 		<div class="card">
 			<h3>Подключение к роутеру</h3>
 			<form method="POST" action="/connect" class="connection-form">
+				<input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
 				<input type="text" name="host" placeholder="Адрес роутера:порт (192.168.1.1:22)" required>
 				<input type="text" name="user" placeholder="Имя пользователя (root)" required>
 				<input type="password" name="password" placeholder="Пароль" required>
@@ -4564,7 +4875,7 @@ const htmlTemplate = `
 
 			{{if .Settings.Groups}}
 			{{range $group, $config := .Settings.Groups}}
-			<div class="group-item {{if index $.GroupStates $group}}active{{end}}">
+			<div class="group-item {{if index $.GroupStates $group}}active{{end}}" data-group="{{$group}}">
 				<div class="group-content">
 					<div style="font-weight: 600; font-size: 16px;">{{$group}}</div>
 					<div class="device-list">
@@ -4635,7 +4946,7 @@ const htmlTemplate = `
 					<form method="POST" action="/api/toggle">
 						<input type="hidden" name="group" value="{{$group}}">
 						<label class="toggle-switch">
-							<input type="checkbox" {{if index $.GroupStates $group}}checked{{end}} onchange="handleToggleChange(event, '{{$group}}')">
+							<input type="checkbox" data-group="{{$group}}" {{if index $.GroupStates $group}}checked{{end}} onchange="handleToggleChange(event, '{{$group}}')">
 							<span class="slider"></span>
 						</label>
 					</form>
@@ -4661,12 +4972,14 @@ const htmlTemplate = `
 				<div class="form-group">
 					<label>Название тега</label>
 					<input type="text" value="{{.EditingTag}}" disabled style="background: var(--hover-bg);">
+					<div id="tagname-error" class="field-error" aria-live="polite"></div>
 					<div class="form-help">Название тега нельзя изменить</div>
 				</div>
 
 				<div class="form-group">
 					<label>DHCP опции</label>
 					<textarea name="dhcpoptions" rows="3" placeholder="6,192.168.1.5&#10;42,192.168.1.1&#10;3,192.168.1.1" required autofocus>{{range $i, $opt := .EditingTagData.DHCPOptions}}{{if $i}}&#10;{{end}}{{$opt}}{{end}}</textarea>
+					<div id="dhcpoptions-error" class="field-error" aria-live="polite"></div>
 					<div class="form-help">Каждая опция на отдельной строке. Формат: код_опции,значение</div>
 				</div>
 
@@ -4681,12 +4994,14 @@ const htmlTemplate = `
 				<div class="form-group">
 					<label>Название тега</label>
 					<input type="text" name="tagname" placeholder="filterdns" required>
+					<div id="tagname-error" class="field-error" aria-live="polite"></div>
 					<div class="form-help">Уникальный идентификатор DNS-тега</div>
 				</div>
 
 				<div class="form-group">
 					<label>DHCP опции</label>
 					<textarea name="dhcpoptions" rows="3" placeholder="6,192.168.1.5&#10;42,192.168.1.1&#10;3,192.168.1.1" required></textarea>
+					<div id="dhcpoptions-error" class="field-error" aria-live="polite"></div>
 					<div class="form-help">Каждая опция на отдельной строке. Формат: код_опции,значение</div>
 				</div>
 
@@ -4715,6 +5030,10 @@ const htmlTemplate = `
 				</div>
 				{{end}}
 			</div>
+			{{else}}
+			<p style="margin-top: 20px; color: var(--text-secondary); font-style: italic;">
+				Пока нет созданных DNS-тегов. Заполните форму выше и нажмите «Создать тег».
+			</p>
 			{{end}}
 			{{end}}
 		</div>
@@ -4837,6 +5156,10 @@ const htmlTemplate = `
 				</div>
 				{{end}}
 			</div>
+			{{else}}
+			<p style="margin-top: 30px; color: var(--text-secondary); font-style: italic;">
+				Пока нет групп. Создайте первую группу выше — выберите тег и устройства.
+			</p>
 			{{end}}
 			{{end}}
 		</div>
@@ -4857,12 +5180,16 @@ const htmlTemplate = `
 			</form>
 
 			{{if .FilterContent}}
-			<div style="margin-top: 20px;">
-				<strong>Ссылка на filter.list:</strong>
-				<div style="margin-top: 8px;">
-					<a href="/lists/filter.list" target="_blank" style="color: var(--primary-color); text-decoration: none; padding: 4px 8px; background: rgba(59, 130, 246, 0.1); border-radius: 4px; font-family: monospace; font-size: 13px;">filter.list</a>
+				<div style="margin-top: 20px;">
+					<strong>Ссылка на filter.list:</strong>
+					<div style="margin-top: 8px;">
+						<a href="/lists/filter.list" target="_blank" style="color: var(--primary-color); text-decoration: none; padding: 4px 8px; background: rgba(59, 130, 246, 0.1); border-radius: 4px; font-family: monospace; font-size: 13px;">filter.list</a>
+					</div>
 				</div>
-			</div>
+			{{else}}
+				<p style="margin-top: 20px; color: var(--text-secondary); font-style: italic;">
+					Список доменов пуст. Вставьте домены ниже (по одному на строку) и нажмите «Сохранить фильтр лист».
+				</p>
 			{{end}}
 		</div>
 		</div><!-- /tab-filterlist -->
@@ -4871,13 +5198,13 @@ const htmlTemplate = `
 	</div>
 
 	<!-- Модальное окно для настройки расписаний -->
-	<div id="scheduleModal" class="schedule-modal">
+	<div id="scheduleModal" class="schedule-modal" role="dialog" aria-modal="true" aria-labelledby="scheduleModalTitle">
 		<div class="schedule-modal-content">
-			<h3>Настройка расписаний для группы "<span id="scheduleGroupName"></span>"</h3>
+			<h3 id="scheduleModalTitle">Настройка расписаний для группы "<span id="scheduleGroupName"></span>"</h3>
 
 			<p style="color: var(--text-secondary); font-size: 13px; margin-bottom: 16px;">
-				Расписания определяют временные интервалы, когда фильтрация для этой группы будет <strong>автоматически отключаться</strong>.
-				Во всё остальное время фильтр будет <strong>включён</strong>.
+				Расписание управляет <strong>авто-отключением фильтра</strong> для этой группы.
+				В указанные интервалы фильтрация будет <strong>выключена</strong>, а в остальное время — <strong>включена</strong>.
 			</p>
 
 			<input type="hidden" id="modalGroupName" name="group_name">
@@ -4893,9 +5220,9 @@ const htmlTemplate = `
 	</div>
 
 	<!-- Модальное окно для настройки действия при отключении -->
-	<div id="disableActionModal" class="schedule-modal">
+	<div id="disableActionModal" class="schedule-modal" role="dialog" aria-modal="true" aria-labelledby="disableActionModalTitle">
 		<div class="schedule-modal-content">
-			<h3 style="margin-bottom: 20px;">Действие при отключении фильтра</h3>
+			<h3 id="disableActionModalTitle" style="margin-bottom: 20px;">Действие при отключении фильтра</h3>
 			<form id="disableActionForm">
 				<input type="hidden" id="disableActionGroupName" name="group_name">
 
@@ -4934,9 +5261,9 @@ const htmlTemplate = `
 	</div>
 
 	<!-- Модальное окно для настройки DHCP Lease Time -->
-	<div id="leasetimeModal" class="schedule-modal">
+	<div id="leasetimeModal" class="schedule-modal" role="dialog" aria-modal="true" aria-labelledby="leasetimeModalTitle">
 		<div class="schedule-modal-content">
-			<h3 style="margin-bottom: 20px;">Настройка срока аренды DHCP</h3>
+			<h3 id="leasetimeModalTitle" style="margin-bottom: 20px;">Настройка срока аренды DHCP</h3>
 			<form id="leasetimeForm">
 				<input type="hidden" id="leasetimeGroupName" name="group_name">
 
@@ -4986,12 +5313,107 @@ const htmlTemplate = `
 		var currentSchedules = [];
 		var currentGroupName = '';
 
-		// Theme management
+		// CSRF token для POST-запросов (добавляется в заголовок для fetch).
+		var csrfToken = '{{.CSRFToken}}';
+		(function() {
+			if (!csrfToken) return;
+			var originalFetch = window.fetch;
+			window.fetch = function(input, init) {
+				init = init || {};
+				var method = init.method || 'GET';
+				if (typeof method === 'string') method = method.toUpperCase();
+
+				if (method === 'POST') {
+					if (!init.headers) init.headers = {};
+					if (init.headers instanceof Headers) {
+						init.headers.set('X-CSRF-Token', csrfToken);
+					} else {
+						init.headers['X-CSRF-Token'] = csrfToken;
+					}
+				}
+				return originalFetch(input, init);
+			};
+		})();
+
+		// Таймеры для toast-уведомлений
+		var statusHideTimeout = null;
+
+		// Вспомогательные функции доступности для модальных окон
+		var activeModal = null;
+		var lastModalFocus = null;
+
+		function getFocusableElements(container) {
+			if (!container) return [];
+			return Array.prototype.slice.call(container.querySelectorAll(
+				'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])'
+			)).filter(function(el) {
+				if (el.disabled) return false;
+				// offsetParent — простая эвристика видимости
+				if (el.offsetParent === null) return false;
+				return true;
+			});
+		}
+
+		function openA11yModal(modalEl) {
+			if (!modalEl) return;
+			activeModal = modalEl;
+			lastModalFocus = document.activeElement;
+
+			modalEl.style.display = 'block';
+			var focusables = getFocusableElements(modalEl);
+			if (focusables.length > 0) {
+				focusables[0].focus();
+			}
+
+			// Фокус-ловушка для Tab / Shift+Tab
+			modalEl._focusTrapHandler = function(e) {
+				if (e.key !== 'Tab') return;
+				var list = getFocusableElements(modalEl);
+				if (list.length === 0) return;
+
+				var first = list[0];
+				var last = list[list.length - 1];
+				var current = document.activeElement;
+
+				if (e.shiftKey && current === first) {
+					e.preventDefault();
+					last.focus();
+				} else if (!e.shiftKey && current === last) {
+					e.preventDefault();
+					first.focus();
+				}
+			};
+			modalEl.addEventListener('keydown', modalEl._focusTrapHandler);
+		}
+
+		function closeA11yModal(modalEl) {
+			if (!modalEl) return;
+
+			modalEl.style.display = 'none';
+			if (modalEl._focusTrapHandler) {
+				modalEl.removeEventListener('keydown', modalEl._focusTrapHandler);
+				modalEl._focusTrapHandler = null;
+			}
+
+			if (activeModal === modalEl) activeModal = null;
+			if (lastModalFocus && typeof lastModalFocus.focus === 'function') {
+				lastModalFocus.focus();
+			}
+		}
+
+		document.addEventListener('keydown', function(e) {
+			if (e.key === 'Escape' && activeModal) {
+				e.preventDefault();
+				closeA11yModal(activeModal);
+			}
+		});
+
+		// Управление темой
 		function setTheme(isDark) {
 			document.documentElement.setAttribute('data-theme', isDark ? 'dark' : 'light');
 			localStorage.setItem('theme', isDark ? 'dark' : 'light');
 
-			// Send theme to server
+			// Отправляем тему на сервер
 			fetch('/api/theme', {
 				method: 'POST',
 				headers: {'Content-Type': 'application/x-www-form-urlencoded'},
@@ -4999,7 +5421,7 @@ const htmlTemplate = `
 			});
 		}
 
-		// Load saved theme
+		// Загружаем сохраненную тему
 		function loadTheme() {
 			var savedTheme = localStorage.getItem('theme');
 			var systemDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
@@ -5009,28 +5431,57 @@ const htmlTemplate = `
 			setTheme(isDark);
 		}
 
-		// Status message notifications
+		// Всплывающие уведомления о статусе
 		function showStatus(message, type) {
 			type = type || 'success';
 
-			// Remove existing status message
-			var existing = document.querySelector('.status-message');
-			if (existing) existing.remove();
+			var statusDiv = document.querySelector('.status-message');
+			if (!statusDiv) {
+				statusDiv = document.createElement('div');
+				statusDiv.className = 'status-message ' + type;
+				statusDiv.setAttribute('role', 'status');
+				statusDiv.setAttribute('aria-live', 'polite');
+				statusDiv.setAttribute('aria-atomic', 'true');
+				statusDiv.tabIndex = -1;
+				document.body.appendChild(statusDiv);
+			} else {
+				statusDiv.className = 'status-message ' + type;
+			}
 
-			// Create new status message
-			var statusDiv = document.createElement('div');
-			statusDiv.className = 'status-message ' + type;
 			statusDiv.textContent = message;
-			document.body.appendChild(statusDiv);
+			// Явно делаем видимым при показе; в CSS может быть display:none по умолчанию.
+			statusDiv.style.display = 'flex';
 
-			// Show status message
-			setTimeout(function() { statusDiv.classList.add('show'); }, 100);
+			// Перезапускаем анимацию показа, чтобы обновления отображались стабильно
+			statusDiv.classList.remove('show');
+			// Принудительный reflow
+			void statusDiv.offsetWidth;
+			statusDiv.classList.add('show');
 
-			// Auto hide
-			setTimeout(function() {
+			if (statusHideTimeout) clearTimeout(statusHideTimeout);
+			statusHideTimeout = setTimeout(function() {
 				statusDiv.classList.remove('show');
-				setTimeout(function() { statusDiv.remove(); }, 300);
 			}, 3000);
+		}
+
+		function syncNow() {
+			showStatus('Синхронизация с роутером...', 'info');
+
+			fetch('/api/sync-now', {
+				method: 'POST'
+			})
+				.then(function(response) { return response.json(); })
+				.then(function(data) {
+					showStatus(data.desc || 'Синхронизация завершена', data.level);
+					return Promise.all([
+						refreshFilterTabFromServer(),
+						refreshGroupsTabFromServer()
+					]);
+				})
+				.catch(function(error) {
+					console.error('Error syncing:', error);
+					showStatus('Ошибка синхронизации с роутером', 'error');
+				});
 		}
 
 		// Device count updater
@@ -5128,13 +5579,13 @@ const htmlTemplate = `
 				.then(function(data) {
 					currentSchedules = data || [];
 					renderSchedulesList();
-					document.getElementById('scheduleModal').style.display = 'block';
+					openA11yModal(document.getElementById('scheduleModal'));
 				})
 				.catch(function(error) {
 					console.error('Error loading schedules:', error);
 					currentSchedules = [];
 					renderSchedulesList();
-					document.getElementById('scheduleModal').style.display = 'block';
+					openA11yModal(document.getElementById('scheduleModal'));
 				});
 		}
 
@@ -5363,6 +5814,7 @@ const htmlTemplate = `
 				if (data.level === 'success') {
 					showStatus(data.desc, 'success');
 					renderSchedulesList();
+					refreshGroupRuntimeState(currentGroupName);
 				} else {
 					showStatus(data.desc, 'error');
 				}
@@ -5373,12 +5825,87 @@ const htmlTemplate = `
 			});
 		}
 
+		function refreshGroupRuntimeState(groupName) {
+			if (!groupName) return;
+			fetch('/api/group-state/' + encodeURIComponent(groupName))
+				.then(function(response) { return response.json(); })
+				.then(function(data) {
+					var isActive = !!data.active;
+					var groupItem = document.querySelector('.group-item[data-group="' + groupName + '"]');
+					if (groupItem) {
+						groupItem.classList.toggle('active', isActive);
+					}
+
+					var toggle = document.querySelector('.group-actions input[type="checkbox"][data-group="' + groupName + '"]');
+					if (toggle) {
+						toggle.checked = isActive;
+					}
+				})
+				.catch(function(error) {
+					console.error('Error refreshing group runtime state:', error);
+				});
+		}
+
+		function refreshSchedulesPreviewForGroup(groupName) {
+			if (!groupName) return;
+			fetch('/api/schedules/' + encodeURIComponent(groupName))
+				.then(function(response) { return response.json(); })
+				.then(function(schedules) {
+					var enabledCount = (schedules || []).filter(function(s) { return s.enabled; }).length;
+
+					var statusDiv = document.querySelector('.schedule-status[data-group="' + groupName + '"]');
+					if (statusDiv) {
+						var infoSpan = statusDiv.querySelector('.schedules-enabled-info');
+						if (infoSpan) infoSpan.textContent = ' (активных: ' + enabledCount + ')';
+					}
+
+					var previewContainer = document.querySelector('.schedules-preview[data-group="' + groupName + '"]');
+					if (!previewContainer) return;
+
+					var sortedSchedules = (schedules || []).slice().sort(function(a, b) {
+						var timeA = a.start_hour * 60 + a.start_min;
+						var timeB = b.start_hour * 60 + b.start_min;
+						return timeA - timeB;
+					});
+
+					var html = '';
+					sortedSchedules.forEach(function(schedule) {
+						var startTime = String(schedule.start_hour).padStart(2, '0') + ':' + String(schedule.start_min).padStart(2, '0');
+						var endTime = String(schedule.end_hour).padStart(2, '0') + ':' + String(schedule.end_min).padStart(2, '0');
+						var disabledClass = schedule.enabled ? '' : ' disabled';
+						var dl = daysLabel(schedule.days);
+						var daysHint = dl !== 'Каждый день' ? ' <span style="opacity:0.75">(' + dl + ')</span>' : '';
+
+						html += '<div class="schedule-preview-item' + disabledClass + '">' +
+							'<span class="schedule-preview-icon"></span>' +
+							'<span>' + startTime + ' — ' + endTime + daysHint + '</span>' +
+							'</div>';
+					});
+
+					previewContainer.innerHTML = html;
+				})
+				.catch(function(error) {
+					console.error('Error refreshing schedules preview:', error);
+				});
+		}
+
 		function closeScheduleModal() {
-			document.getElementById('scheduleModal').style.display = 'none';
-			setTimeout(function() { location.reload(); }, 500);
+			var modalEl = document.getElementById('scheduleModal');
+			closeA11yModal(modalEl);
+			// Модификации расписаний уже отправлены на сервер, поэтому обновляем только нужный кусок UI.
+			refreshSchedulesPreviewForGroup(currentGroupName);
 		}
 
 		/* ===== Tab navigation ===== */
+		function rememberActiveTab() {
+			try {
+				var panel = document.querySelector('.tab-panel.active');
+				if (!panel || !panel.id) return;
+				if (panel.id.indexOf('tab-') !== 0) return;
+				localStorage.setItem('activeTab', panel.id.replace('tab-', ''));
+			} catch (e) {}
+		}
+
 		function switchTab(tabId, btn) {
 			document.querySelectorAll('.tab-panel').forEach(function(p) {
 				p.classList.remove('active');
@@ -5420,12 +5947,55 @@ const htmlTemplate = `
 			.then(function(data) {
 				showStatus(data.desc, data.level);
 				if (data.level === 'success') {
-					setTimeout(function() { location.reload(); }, 1000);
+					refreshFilterTabFromServer();
 				}
 			})
 			.catch(function(err) {
 				showStatus('Ошибка: ' + err.message, 'error');
 			});
+		}
+
+		function refreshFilterTabFromServer() {
+			return fetch('/')
+				.then(function(response) { return response.text(); })
+				.then(function(html) {
+					var parser = new DOMParser();
+					var doc = parser.parseFromString(html, 'text/html');
+					var newTabFilter = doc.querySelector('#tab-filter');
+					var currentTabFilter = document.querySelector('#tab-filter');
+					if (!newTabFilter || !currentTabFilter) return;
+
+					currentTabFilter.innerHTML = newTabFilter.innerHTML;
+
+					// После подмены панели обновляем runtime-состояния и превью расписаний.
+					document.querySelectorAll('#tab-filter .group-item[data-group]').forEach(function(item) {
+						var groupName = item.getAttribute('data-group');
+						if (!groupName) return;
+						refreshGroupRuntimeState(groupName);
+						refreshSchedulesPreviewForGroup(groupName);
+					});
+				})
+				.catch(function(error) {
+					console.error('Error refreshing filter tab:', error);
+				});
+		}
+
+		function refreshGroupsTabFromServer() {
+			return fetch('/')
+				.then(function(response) { return response.text(); })
+				.then(function(html) {
+					var parser = new DOMParser();
+					var doc = parser.parseFromString(html, 'text/html');
+					var newTabGroups = doc.querySelector('#tab-groups');
+					var currentTabGroups = document.querySelector('#tab-groups');
+					if (!newTabGroups || !currentTabGroups) return;
+
+					currentTabGroups.innerHTML = newTabGroups.innerHTML;
+					attachGroupFormHandlers();
+				})
+				.catch(function(error) {
+					console.error('Error refreshing groups tab:', error);
+				});
 		}
 
 		function openDisableActionModal(groupName) {
@@ -5450,11 +6020,11 @@ const htmlTemplate = `
 					console.error('Error loading disable action:', error);
 				});
 
-			document.getElementById('disableActionModal').style.display = 'block';
+			openA11yModal(document.getElementById('disableActionModal'));
 		}
 
 		function closeDisableActionModal() {
-			document.getElementById('disableActionModal').style.display = 'none';
+			closeA11yModal(document.getElementById('disableActionModal'));
 		}
 
 		function toggleTagSelect() {
@@ -5479,9 +6049,10 @@ const htmlTemplate = `
 				.then(function(response) { return response.json(); })
 				.then(function(data) {
 					if (data.level === 'success') {
+						var groupName = document.getElementById('disableActionGroupName').value;
 						closeDisableActionModal();
 						showStatus('Настройки действия сохранены', 'success');
-						setTimeout(function() { location.reload(); }, 1000);
+						refreshGroupRuntimeState(groupName);
 					} else {
 						showStatus(data.desc, 'error');
 					}
@@ -5522,11 +6093,11 @@ const htmlTemplate = `
 					console.error('Error loading leasetime:', error);
 				});
 
-			document.getElementById('leasetimeModal').style.display = 'block';
+			openA11yModal(document.getElementById('leasetimeModal'));
 		}
 
 		function closeLeasetimeModal() {
-			document.getElementById('leasetimeModal').style.display = 'none';
+			closeA11yModal(document.getElementById('leasetimeModal'));
 
 			// Сбрасываем форму
 			var modeRadios = document.getElementsByName('mode');
@@ -5555,9 +6126,10 @@ const htmlTemplate = `
 				.then(function(response) { return response.json(); })
 				.then(function(data) {
 					if (data.level === 'success') {
+						var groupName = document.getElementById('leasetimeGroupName').value;
 						closeLeasetimeModal();
 						showStatus('Настройки срока аренды сохранены', 'success');
-						setTimeout(function() { location.reload(); }, 1000);
+						refreshGroupRuntimeState(groupName);
 					} else {
 						showStatus(data.desc, 'error');
 					}
@@ -5605,7 +6177,7 @@ const htmlTemplate = `
 				.then(function(data) {
 					showStatus(data.desc, data.level);
 					if (data.level === 'success') {
-						setTimeout(function() { location.reload(); }, 1000);
+						setTimeout(function() { rememberActiveTab(); location.reload(); }, 1000);
 					}
 				})
 				.catch(function(error) {
@@ -5639,9 +6211,13 @@ const htmlTemplate = `
 			})
 			.then(function(response) { return response.json(); })
 			.then(function(data) {
-				if (data.level === 'success') {
+				if (data.level === 'success' || data.level === 'warning') {
 					showStatus(data.desc, 'success');
-					setTimeout(function() { window.location.href = '/'; }, 1000);
+					// Без полной перезагрузки: обновляем runtime-состояние карточки.
+					refreshGroupRuntimeState(groupName);
+					// toggle вручную может отключить все расписания в группе на сервере,
+					// поэтому сразу обновляем блок расписаний в UI.
+					refreshSchedulesPreviewForGroup(groupName);
 				} else {
 					showStatus(data.desc, 'error');
 					checkbox.checked = !checkbox.checked;
@@ -5657,6 +6233,11 @@ const htmlTemplate = `
 		function handleTagFormSubmit(form, event) {
 			event.preventDefault();
 
+			var tagErrEl = document.getElementById('tagname-error');
+			var dhcpErrEl = document.getElementById('dhcpoptions-error');
+			if (tagErrEl) tagErrEl.textContent = '';
+			if (dhcpErrEl) dhcpErrEl.textContent = '';
+
 			var formData = new FormData(form);
 			var action = form.getAttribute('action');
 
@@ -5667,10 +6248,16 @@ const htmlTemplate = `
 			.then(function(response) { return response.json(); })
 			.then(function(data) {
 				if (data.level === 'success') {
+					if (tagErrEl) tagErrEl.textContent = '';
+					if (dhcpErrEl) dhcpErrEl.textContent = '';
 					showStatus(data.desc, 'success');
 					setTimeout(function() { window.location.href = '/'; }, 1000);
 				} else {
 					showStatus(data.desc, 'error');
+					if (data.field_errors) {
+						if (data.field_errors.tagname && tagErrEl) tagErrEl.textContent = data.field_errors.tagname;
+						if (data.field_errors.dhcpoptions && dhcpErrEl) dhcpErrEl.textContent = data.field_errors.dhcpoptions;
+					}
 				}
 			})
 			.catch(function(error) {
@@ -5691,9 +6278,14 @@ const htmlTemplate = `
 			})
 			.then(function(response) { return response.json(); })
 			.then(function(data) {
-				if (data.level === 'success') {
+				if (data.level === 'success' || data.level === 'warning') {
 					showStatus(data.desc, 'success');
-					setTimeout(function() { window.location.href = '/'; }, 1000);
+					Promise.all([
+						refreshGroupsTabFromServer(),
+						refreshFilterTabFromServer()
+					]).then(function() {
+						switchTab('groups', null);
+					});
 				} else {
 					showStatus(data.desc, 'error');
 				}
@@ -5734,6 +6326,37 @@ const htmlTemplate = `
 			form.submit();
 		}
 
+		function updateFilterListUIFromServer() {
+			return fetch('/lists/filter.list')
+				.then(function(res) { return res.text(); })
+				.then(function(content) {
+					var textarea = document.querySelector('textarea[name="filter_content"]');
+					if (textarea) textarea.value = content;
+
+					var hasContent = content && content.trim().length > 0;
+					var existingWrap = document.getElementById('filterlist-link-wrap');
+
+					if (hasContent) {
+						if (!existingWrap) {
+							existingWrap = document.createElement('div');
+							existingWrap.id = 'filterlist-link-wrap';
+							existingWrap.style.marginTop = '20px';
+							existingWrap.innerHTML =
+								'<strong>Ссылка на filter.list:</strong>' +
+								'<div style="margin-top: 8px;">' +
+								'<a href="/lists/filter.list" target="_blank" style="color: var(--primary-color); text-decoration: none; padding: 4px 8px; background: rgba(59, 130, 246, 0.1); border-radius: 4px; font-family: monospace; font-size: 13px;">filter.list</a>' +
+								'</div>';
+
+							var form = document.querySelector('#tab-filterlist form[action="/api/save-filter"]') || document.querySelector('#tab-filterlist form');
+							if (form && form.parentElement) form.parentElement.appendChild(existingWrap);
+							else document.getElementById('tab-filterlist').appendChild(existingWrap);
+						}
+					} else if (existingWrap) {
+						existingWrap.remove();
+					}
+				});
+		}
+
 		function handleFilterFormSubmit(form, event) {
 			event.preventDefault();
 
@@ -5747,7 +6370,10 @@ const htmlTemplate = `
 			.then(function(data) {
 				if (data.level === 'success') {
 					showStatus(data.desc, 'success');
-					setTimeout(function() { location.reload(); }, 1000);
+					// filter.list обновляется на сервере и уже доступен по /lists/filter.list
+					updateFilterListUIFromServer().catch(function(err) {
+						console.error('Error refreshing filter.list UI:', err);
+					});
 				} else {
 					showStatus(data.desc, 'error');
 				}
@@ -5795,7 +6421,7 @@ const htmlTemplate = `
 			.then(function(data) {
 				if (data.level === 'success') {
 					showStatus(data.desc, 'success');
-					setTimeout(function() { location.reload(); }, 1000);
+					setTimeout(function() { rememberActiveTab(); location.reload(); }, 1000);
 				} else {
 					showStatus(data.desc, 'error');
 				}
@@ -5806,17 +6432,67 @@ const htmlTemplate = `
 			});
 		}
 
-		// Initialize
+		function attachGroupFormHandlers() {
+			var deleteGroupForms = document.querySelectorAll('form[action="/api/delete-group"]');
+			deleteGroupForms.forEach(function(form) {
+				if (form.dataset.boundDeleteGroup === '1') return;
+				form.dataset.boundDeleteGroup = '1';
+				form.addEventListener('submit', function(event) {
+					var groupName = this.querySelector('input[name="group_name"]').value;
+					if (!confirm('Удалить группу ' + groupName + '?')) {
+						event.preventDefault();
+						return false;
+					}
+
+					event.preventDefault();
+					var formData = new FormData(this);
+
+					fetch('/api/delete-group', {
+						method: 'POST',
+						body: formData
+					})
+					.then(function(response) { return response.json(); })
+					.then(function(data) {
+						if (data.level === 'success') {
+							showStatus(data.desc, 'success');
+							Promise.all([
+								refreshGroupsTabFromServer(),
+								refreshFilterTabFromServer()
+							]).then(function() {
+								switchTab('groups', null);
+							});
+						} else {
+							showStatus(data.desc, 'error');
+						}
+					})
+					.catch(function(error) {
+						console.error('Error:', error);
+						showStatus('Произошла ошибка при удалении группы', 'error');
+					});
+				});
+			});
+
+			var groupForms = document.querySelectorAll('form[action="/api/create-group"], form[action="/api/update-group"]');
+			groupForms.forEach(function(form) {
+				if (form.dataset.boundGroupSubmit === '1') return;
+				form.dataset.boundGroupSubmit = '1';
+				form.addEventListener('submit', function(event) {
+					handleGroupFormSubmit(this, event);
+				});
+			});
+		}
+
+		// Инициализация
 		document.addEventListener('DOMContentLoaded', function() {
 			loadTheme();
 			updateDeviceCount();
 
-			// Theme toggle handler
+			// Обработчик переключателя темы
 			document.getElementById('theme-toggle').addEventListener('change', function() {
 				setTheme(this.checked);
 			});
 
-			// System theme change listener
+			// Слушатель изменения системной темы
 			window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', function() {
 				if (!localStorage.getItem('theme')) {
 					loadTheme();
@@ -5839,54 +6515,7 @@ const htmlTemplate = `
 				});
 			});
 
-			// Привязываем обработчики к формам удаления групп
-			var deleteGroupForms = document.querySelectorAll('form[action="/api/delete-group"]');
-			deleteGroupForms.forEach(function(form) {
-				form.addEventListener('submit', function(event) {
-					var groupName = this.querySelector('input[name="group_name"]').value;
-					if (!confirm('Удалить группу ' + groupName + '?')) {
-						event.preventDefault();
-						return false;
-					}
-
-					event.preventDefault();
-					var formData = new FormData(this);
-
-					fetch('/api/delete-group', {
-						method: 'POST',
-						body: formData
-					})
-					.then(function(response) { return response.json(); })
-					.then(function(data) {
-						if (data.level === 'success') {
-							showStatus(data.desc, 'success');
-							setTimeout(function() { location.reload(); }, 1000);
-						} else {
-							showStatus(data.desc, 'error');
-						}
-					})
-					.catch(function(error) {
-						console.error('Error:', error);
-						showStatus('Произошла ошибка при удалении группы', 'error');
-					});
-				});
-			});
-
-			// Привязываем обработчики к формам создания групп
-			var groupForms = document.querySelectorAll('form[action="/api/create-group"]');
-			groupForms.forEach(function(form) {
-				form.addEventListener('submit', function(event) {
-					handleGroupFormSubmit(this, event);
-				});
-			});
-
-			// Привязываем обработчики к формам редактирования групп
-			var updateGroupForms = document.querySelectorAll('form[action="/api/update-group"]');
-			updateGroupForms.forEach(function(form) {
-				form.addEventListener('submit', function(event) {
-					handleGroupFormSubmit(this, event);
-				});
-			});
+			attachGroupFormHandlers();
 
 			// Привязываем обработчики к формам редактирования тегов
 			var updateTagForms = document.querySelectorAll('form[action="/api/update-tag"]');
